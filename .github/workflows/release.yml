@@ -8,38 +8,76 @@ on:
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          targets: ${{ matrix.target }}
 
       - name: Install cross
+        if: matrix.cross
         uses: taiki-e/install-action@v2
         with:
           tool: cross
 
-      - name: Build (${{ matrix.target }})
-        run: cross build --release --target ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.cross }}
+        run: |
+          if [ "$USE_CROSS" = "true" ]; then
+            cross build --release --target "$TARGET"
+          else
+            cargo build --release --target "$TARGET"
+          fi
 
       - name: Package binary
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          binary="target/${{ matrix.target }}/release/ai-api-bridge"
-          tar -czf "ai-api-bridge-${{ matrix.target }}.tar.gz" -C "$(dirname "$binary")" "$(basename "$binary")"
+          name="ai-api-bridge-${TARGET}"
+          dir="target/${TARGET}/release"
+          case "$TARGET" in
+            *windows*)
+              cp "${dir}/ai-api-bridge.exe" .
+              7z a "${name}.zip" "ai-api-bridge.exe"
+              ;;
+            *)
+              tar -czf "${name}.tar.gz" -C "${dir}" "ai-api-bridge"
+              ;;
+          esac
 
       - uses: actions/upload-artifact@v4
         with:
           name: ai-api-bridge-${{ matrix.target }}
-          path: ai-api-bridge-${{ matrix.target }}.tar.gz
+          path: |
+            ai-api-bridge-${{ matrix.target }}.tar.gz
+            ai-api-bridge-${{ matrix.target }}.zip
+          if-no-files-found: ignore
 
   docker:
     name: Build & push Docker image
@@ -113,7 +151,9 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: ai-api-bridge-*.tar.gz
+          files: |
+            ai-api-bridge-*.tar.gz
+            ai-api-bridge-*.zip
           body_path: CHANGELOG.txt
           draft: false
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}

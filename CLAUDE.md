@@ -66,9 +66,10 @@ wire-format directly:
 ## Spec & plan
 - Spec: `docs/superpowers/specs/2026-06-05-ai-api-bridge-design.md`
 - Plan: `docs/superpowers/plans/2026-06-05-ai-api-bridge.md`
+
 ## CI / Release
 - CI (`.github/workflows/ci.yml`): test + fmt + clippy + build on every push/PR to `main`.
-- Release (`.github/workflows/release.yml`): push a `v*` tag → cross builds x86_64 + aarch64 musl static binaries, packages as `.tar.gz`, creates a GitHub Release with changelog.
+- Release (`.github/workflows/release.yml`): push a `v*` tag → builds Linux (x86_64 + aarch64 musl static, via `cross`), Windows (x86_64-msvc) and macOS (arm64 + x86_64) binaries, packages as `.tar.gz` (`.zip` on Windows), creates a GitHub Release with changelog.
 - Cross-compile locally: `cross build --release --target x86_64-unknown-linux-musl` (x86_64) or `aarch64-unknown-linux-musl` (ARM64). See `Cross.toml`.
 
 ## Docker
