@@ -36,6 +36,29 @@ async fn mock_chat_error() -> axum::response::Response {
         .unwrap()
 }
 
+// A non-streaming Chat Completions JSON response.
+async fn mock_chat_json() -> axum::response::Response {
+    let body = r#"{"model":"m","choices":[{"message":{"content":"Hello world"}}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#;
+    axum::response::Response::builder()
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+// A streaming Chat Completions response that makes a tool call.
+async fn mock_chat_tool() -> axum::response::Response {
+    let body = concat!(
+        "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
 async fn spawn(app: Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -153,8 +176,107 @@ async fn lists_models() {
     );
 }
 
+fn messages_bridge_url_for(upstream_url: &str) -> Config {
+    Config::from_toml(&format!(
+        "default_provider=\"zen\"\n[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"{upstream_url}\""
+    ))
+    .unwrap()
+}
+
 #[tokio::test]
-async fn messages_endpoint_returns_501() {
+async fn messages_streaming_end_to_end() {
+    let upstream_url = spawn(Router::new().route("/chat/completions", post(mock_chat))).await;
+    let cfg = messages_bridge_url_for(&upstream_url);
+    let bridge_url = spawn(build_app(Arc::new(AppState {
+        config: cfg,
+        upstream: Upstream::new(),
+    })))
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{bridge_url}/v1/messages"))
+        .header("x-api-key", "anything")
+        .json(&json!({
+            "model": "claude-x", "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}], "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let text = resp.text().await.unwrap();
+
+    assert!(text.contains("event: message_start"), "got: {text}");
+    assert!(text.contains("event: content_block_start"));
+    assert!(text.contains("text_delta"));
+    assert!(text.contains("Hello"));
+    assert!(text.contains("world"));
+    assert!(text.contains("event: message_delta"));
+    assert!(text.contains("\"stop_reason\":\"end_turn\""));
+    assert!(text.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn messages_non_streaming_end_to_end() {
+    let upstream_url = spawn(Router::new().route("/chat/completions", post(mock_chat_json))).await;
+    let cfg = messages_bridge_url_for(&upstream_url);
+    let bridge_url = spawn(build_app(Arc::new(AppState {
+        config: cfg,
+        upstream: Upstream::new(),
+    })))
+    .await;
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .post(format!("{bridge_url}/v1/messages"))
+        .json(&json!({
+            "model": "claude-x", "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}], "stream": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["role"], "assistant");
+    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["content"][0]["text"], "Hello world");
+    assert_eq!(body["stop_reason"], "end_turn");
+}
+
+#[tokio::test]
+async fn messages_tool_use_streaming() {
+    let upstream_url = spawn(Router::new().route("/chat/completions", post(mock_chat_tool))).await;
+    let cfg = messages_bridge_url_for(&upstream_url);
+    let bridge_url = spawn(build_app(Arc::new(AppState {
+        config: cfg,
+        upstream: Upstream::new(),
+    })))
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{bridge_url}/v1/messages"))
+        .json(&json!({
+            "model": "claude-x", "max_tokens": 256,
+            "messages": [{"role": "user", "content": "weather in SF?"}],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let text = resp.text().await.unwrap();
+
+    assert!(text.contains("\"type\":\"tool_use\""), "got: {text}");
+    assert!(text.contains("get_weather"));
+    assert!(text.contains("input_json_delta"));
+    assert!(text.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn messages_missing_model_returns_400() {
     let cfg = Config::from_toml("[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"u\"").unwrap();
     let url = spawn(build_app(Arc::new(AppState {
         config: cfg,
@@ -167,5 +289,5 @@ async fn messages_endpoint_returns_501() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 501);
+    assert_eq!(resp.status(), 400);
 }

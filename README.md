@@ -1,9 +1,9 @@
 # ai-api-bridge
 
 A local format-translating AI API proxy. It presents the OpenAI **Responses API**
-to clients (e.g. the Codex CLI) and translates each call into an OpenAI
-**Chat Completions** request to an upstream provider (e.g. your OpenCode Zen
-account), then translates the streaming response back.
+(for the Codex CLI) and the Anthropic **Messages API** (for Claude Code) to clients,
+translates each call into an OpenAI **Chat Completions** request to an upstream provider
+(e.g. your OpenCode Zen account), then translates the streaming response back.
 
 ## Quickstart
 
@@ -31,11 +31,20 @@ env_key = "BRIDGE_KEY"   # value ignored unless `auth_token` is set in bridge.to
 BRIDGE_KEY=x codex
 ```
 
+Or point **Claude Code** at it (it speaks the Anthropic Messages API via `ANTHROPIC_BASE_URL`):
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8282
+export ANTHROPIC_API_KEY=<bridge auth_token, or any value if auth_token is unset>
+export ANTHROPIC_MODEL=gpt-5.5    # must match a [[routes]] alias
+claude
+```
+
 ## Endpoints
 - `POST /v1/responses` — OpenAI Responses API (for Codex).
+- `POST /v1/messages` — Anthropic Messages API (for Claude Code).
 - `POST /v1/chat/completions` — OpenAI Chat Completions (passthrough).
 - `GET /v1/models` — configured aliases.
-- `POST /v1/messages` — Anthropic Messages (not implemented in v1; returns 501).
 - `GET /health`.
 
 ## Config

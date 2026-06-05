@@ -52,7 +52,10 @@ model_prefix = ""                   # model names passed through unchanged
 # config.toml — point that alias here to choose which upstream model serves it.
 # ----------------------------------------------------------------------------
 
-# Codex's `model = "gpt-5.5"` -> go package, deepseek-v4-pro:
+# This single alias serves BOTH clients:
+#   - Codex  (`/v1/responses`): set `model = "gpt-5.5"` in ~/.codex/config.toml
+#   - Claude Code (`/v1/messages`): set ANTHROPIC_BASE_URL=http://127.0.0.1:8282
+#       ANTHROPIC_MODEL=gpt-5.5  ANTHROPIC_API_KEY=<auth_token>
 [[routes]]
 alias = "gpt-5.5"
 provider = "go"

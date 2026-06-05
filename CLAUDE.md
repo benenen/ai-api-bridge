@@ -32,36 +32,44 @@ wire-format directly:
 - `wire/responses.rs` — Responses **inbound**: `parse_request` (client req -> canonical) and
   `ResponsesEmitter` (canonical events -> Responses SSE frames; `final_response()` for the
   non-streaming object).
+- `wire/anthropic.rs` — Anthropic Messages **inbound** (for Claude Code): `parse_request`
+  and `AnthropicEmitter` (canonical events -> `message_start`/`content_block_*`/
+  `message_delta`/`message_stop`; `final_message()` for non-streaming). DeepSeek
+  `reasoning_content` <-> Anthropic `thinking` blocks.
+- `wire/mod.rs` — shared `SseFrame` + the `CanonicalEmitter` trait both emitters implement.
 - `wire/chat.rs` — Chat **outbound**: `build_request`, `ChatStreamParser` (CC stream chunks
   -> canonical events, including surfacing an in-band `{"error":...}` as
   `CanonicalEvent::Error`), `completion_to_events` (non-stream CC response -> canonical
   events). Also `parse_request` for CC **inbound**.
 - `sse.rs` — `SseDecoder` works on **bytes** and only decodes UTF-8 on complete `\n\n`
   event blocks, so a multibyte character split across network chunks is never corrupted.
-- `server.rs` — `stream_sse` is the streaming pipeline: SseDecoder -> ChatStreamParser ->
-  ResponsesEmitter; one upstream chunk can yield several Responses SSE frames. An in-band
-  error or `[DONE]` terminates the stream. The chat-inbound endpoint forwards upstream
-  bytes verbatim via `Body::from_stream` (no re-encoding).
+- `server.rs` — `run_stream` is the streaming pipeline, generic over the
+  `wire::CanonicalEmitter` trait (impl'd by `ResponsesEmitter` and `AnthropicEmitter`):
+  SseDecoder -> ChatStreamParser -> emitter; one upstream chunk can yield several client SSE
+  frames. An in-band error or `[DONE]` terminates the stream. The chat-inbound endpoint
+  forwards upstream bytes verbatim via `Body::from_stream` (no re-encoding).
 - `router.rs` — explicit `[[routes]]` win; otherwise the default provider's `model_prefix`
   is applied (`gpt-5.5` -> `opencode/gpt-5.5`) unless the alias already contains `/`.
 - `upstream.rs` — reqwest client; `post_stream` (SSE) and `post_json` (non-stream).
 
 ## Endpoints
-`POST /v1/responses` (primary, for Codex) · `POST /v1/chat/completions` (passthrough) ·
-`GET /v1/models` · `POST /v1/messages` (Anthropic — 501 stub) · `GET /health`.
+`POST /v1/responses` (Codex) · `POST /v1/messages` (Anthropic Messages, for Claude Code) ·
+`POST /v1/chat/completions` (passthrough) · `GET /v1/models` · `GET /health`.
 
 ## Conventions / gotchas
-- Wire-format dispatch is enum + plain functions, not async trait objects — keeps the
-  streaming code simple. Adding a format = fill its parse/emit/build/parse functions and a
-  route; the canonical layer is unchanged.
+- Wire-format dispatch is plain functions + a sync `CanonicalEmitter` trait (used as a
+  generic bound, not `dyn`/async) — keeps the streaming code simple. Adding a format = fill
+  its parse/emit/build/parse functions and a route; the canonical layer is unchanged.
 - `ResponsesEmitter` item IDs are random UUIDs, so tests assert on event **names** and
   payload fields, not IDs.
 - `post_stream` returns `impl Stream<...> + Send + 'static` — the explicit bound is required
   (axum spawns the SSE body on the multithreaded runtime).
-- Known limitation: no cross-turn encrypted-reasoning reuse (Chat Completions is stateless);
-  inbound `reasoning` items are dropped. See spec §11.
-- Client auth: if `auth_token` is set in config, clients must send
-  `Authorization: Bearer <token>`; otherwise any/no token is accepted.
+- Reasoning round-trip: inbound `reasoning` (Responses) / `thinking` (Anthropic) items are
+  attached to the assistant turn they belong to and echoed back as `reasoning_content` —
+  DeepSeek thinking models require it on every assistant message across multi-step tool turns
+  (see `parse_input_item` in responses.rs and the assistant branch in anthropic.rs).
+- Client auth: if `auth_token` is set, clients send it as `Authorization: Bearer <token>` or
+  `x-api-key: <token>` (Anthropic clients); otherwise any/no token is accepted.
 
 ## Spec & plan
 - Spec: `docs/superpowers/specs/2026-06-05-ai-api-bridge-design.md`

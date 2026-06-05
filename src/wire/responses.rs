@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use crate::canonical::*;
 use crate::error::BridgeError;
+use crate::wire::{CanonicalEmitter, SseFrame, frame, new_id};
 
 pub fn parse_request(body: &Value) -> Result<CanonicalRequest, BridgeError> {
     let obj = body
@@ -243,24 +244,6 @@ fn parse_tool_choice(v: Option<&Value>) -> ToolChoice {
 
 use serde_json::json;
 
-/// One SSE frame: an event name + a JSON payload.
-#[derive(Debug, Clone)]
-pub struct SseFrame {
-    pub event: String,
-    pub data: Value,
-}
-
-fn frame(event: &str, data: Value) -> SseFrame {
-    SseFrame {
-        event: event.to_string(),
-        data,
-    }
-}
-
-fn new_id(prefix: &str) -> String {
-    format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
-}
-
 struct OpenItem {
     id: String,
     output_index: u32,
@@ -288,6 +271,12 @@ pub struct ResponsesEmitter {
     usage: Option<(u32, u32, u32)>,
     final_items: Vec<Value>,
     seq: u64,
+}
+
+impl CanonicalEmitter for ResponsesEmitter {
+    fn emit(&mut self, ev: &CanonicalEvent) -> Vec<SseFrame> {
+        self.on_event(ev)
+    }
 }
 
 impl ResponsesEmitter {

@@ -20,7 +20,7 @@ use crate::error::BridgeError;
 use crate::router;
 use crate::sse::{SseDecoder, SseItem};
 use crate::upstream::Upstream;
-use crate::wire::{chat, responses};
+use crate::wire::{CanonicalEmitter, anthropic, chat, responses};
 
 pub struct AppState {
     pub config: Config,
@@ -45,11 +45,13 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), BridgeError> 
     let Some(expected) = &state.config.auth_token else {
         return Ok(());
     };
-    let got = headers
+    let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
-    if got == Some(expected.as_str()) {
+    // Anthropic clients (e.g. Claude Code) send the key via `x-api-key`.
+    let api_key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+    if bearer == Some(expected.as_str()) || api_key == Some(expected.as_str()) {
         Ok(())
     } else {
         Err(BridgeError::Unauthorized(
@@ -79,7 +81,10 @@ async fn responses_handler(
             .upstream
             .post_stream(resolved.provider, "/chat/completions", &chat_body)
             .await?;
-        Ok(stream_sse(byte_stream, response_id).into_response())
+        Ok(
+            run_stream(byte_stream, response_id, responses::ResponsesEmitter::new())
+                .into_response(),
+        )
     } else {
         let upstream_resp = state
             .upstream
@@ -94,14 +99,17 @@ async fn responses_handler(
     }
 }
 
-fn stream_sse(
+/// Drive the upstream Chat Completions stream through the canonical pipeline and
+/// out as the client's SSE dialect (Responses or Anthropic Messages), chosen by
+/// the `emitter` passed in.
+fn run_stream<E: CanonicalEmitter + Send + 'static>(
     byte_stream: impl Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
     response_id: String,
+    mut emitter: E,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let s = stream! {
         let mut decoder = SseDecoder::default();
         let mut parser = chat::ChatStreamParser::new(response_id);
-        let mut emitter = responses::ResponsesEmitter::new();
         let mut completed = false;
 
         futures_util::pin_mut!(byte_stream);
@@ -114,7 +122,7 @@ fn stream_sse(
                                 let Ok(json) = serde_json::from_str::<Value>(&d) else { continue };
                                 for cev in parser.on_chunk(&json) {
                                     let is_error = matches!(cev, CanonicalEvent::Error { .. });
-                                    for fr in emitter.on_event(&cev) {
+                                    for fr in emitter.emit(&cev) {
                                         yield Ok(Event::default().event(fr.event).data(fr.data.to_string()));
                                     }
                                     if is_error {
@@ -124,7 +132,7 @@ fn stream_sse(
                                 }
                             }
                             SseItem::Done => {
-                                for fr in emitter.on_event(&CanonicalEvent::Completed) {
+                                for fr in emitter.emit(&CanonicalEvent::Completed) {
                                     yield Ok(Event::default().event(fr.event).data(fr.data.to_string()));
                                 }
                                 completed = true;
@@ -135,7 +143,7 @@ fn stream_sse(
                 }
                 Err(e) => {
                     let ev = CanonicalEvent::Error { message: e.to_string(), status: 502 };
-                    for fr in emitter.on_event(&ev) {
+                    for fr in emitter.emit(&ev) {
                         yield Ok(Event::default().event(fr.event).data(fr.data.to_string()));
                     }
                     completed = true;
@@ -145,7 +153,7 @@ fn stream_sse(
         }
 
         if !completed {
-            for fr in emitter.on_event(&CanonicalEvent::Completed) {
+            for fr in emitter.emit(&CanonicalEvent::Completed) {
                 yield Ok(Event::default().event(fr.event).data(fr.data.to_string()));
             }
         }
@@ -195,6 +203,44 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"object": "list", "data": data}))
 }
 
-async fn messages_handler() -> Result<Response, BridgeError> {
-    Err(crate::wire::anthropic::not_implemented())
+/// Anthropic Messages inbound (for Claude Code via `ANTHROPIC_BASE_URL`): parse
+/// → route → call the Chat Completions upstream → translate the response back to
+/// Anthropic Messages (streaming SSE or a single message object).
+async fn messages_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, BridgeError> {
+    check_auth(&state, &headers)?;
+
+    let req = anthropic::parse_request(&body)?;
+    let resolved = router::resolve(&state.config, &req.model)?;
+    let response_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+
+    tracing::info!(model = %req.model, provider = %resolved.provider_name,
+        upstream_model = %resolved.upstream_model, stream = req.stream, "messages request");
+
+    let chat_body = chat::build_request(&req, &resolved.upstream_model, resolved.provider);
+
+    if req.stream {
+        let byte_stream = state
+            .upstream
+            .post_stream(resolved.provider, "/chat/completions", &chat_body)
+            .await?;
+        Ok(
+            run_stream(byte_stream, response_id, anthropic::AnthropicEmitter::new())
+                .into_response(),
+        )
+    } else {
+        let upstream_resp = state
+            .upstream
+            .post_json(resolved.provider, "/chat/completions", &chat_body)
+            .await?;
+        let events = chat::completion_to_events(&upstream_resp, &response_id);
+        let mut emitter = anthropic::AnthropicEmitter::new();
+        for ev in &events {
+            emitter.on_event(ev);
+        }
+        Ok(Json(emitter.final_message()).into_response())
+    }
 }

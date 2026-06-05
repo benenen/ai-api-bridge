@@ -148,14 +148,32 @@ env_key = "BRIDGE_KEY"      # value is ignored unless `auth_token` is set in bri
 
 Run Codex with `BRIDGE_KEY=<auth_token> codex` (any value if `auth_token` is unset).
 
+## Pointing Claude Code at the bridge
+
+Claude Code speaks the Anthropic **Messages API**; point it at the bridge with environment
+variables:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8282
+export ANTHROPIC_API_KEY=<your bridge auth_token>   # sent as x-api-key; any value if auth_token is unset
+export ANTHROPIC_MODEL=gpt-5.5                       # must match a [[routes]] alias
+claude
+```
+
+The bridge accepts the key via either `x-api-key` (default) or `Authorization: Bearer`
+(`ANTHROPIC_AUTH_TOKEN`), checked against `auth_token`. The model name (`ANTHROPIC_MODEL`)
+is resolved through `[[routes]]` exactly like any other client. Thinking models work:
+DeepSeek `reasoning_content` is surfaced as Anthropic `thinking` blocks and carried back
+across turns.
+
 ## Endpoints exposed by the bridge
 
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/responses` | OpenAI Responses API — for Codex. |
+| `POST /v1/messages` | Anthropic Messages API — for Claude Code (`ANTHROPIC_BASE_URL`). |
 | `POST /v1/chat/completions` | OpenAI Chat Completions — verbatim passthrough. |
 | `GET /v1/models` | Lists configured route aliases. |
-| `POST /v1/messages` | Anthropic Messages — not implemented (501). |
 | `GET /health` | Liveness check (returns `ok`). |
 
 ## Full example
