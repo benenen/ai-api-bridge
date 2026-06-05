@@ -16,6 +16,8 @@ streaming response back. Purpose: use an OpenCode Zen account inside the Codex C
 - One test: `cargo test wire::responses::tests::emits_message_sequence_for_text`
 - One module: `cargo test wire::chat::tests`
 - Verbose logs: `RUST_LOG=ai_api_bridge=debug cargo run -- --config bridge.toml`
+- Cross-compile (Linux musl): `cross build --release --target x86_64-unknown-linux-musl`
+- Cross-compile (ARM64): `cross build --release --target aarch64-unknown-linux-musl`
 
 ## Architecture (needs several files to see the whole)
 Translation always goes through a provider-neutral middle layer — never wire-format to
@@ -64,3 +66,7 @@ wire-format directly:
 ## Spec & plan
 - Spec: `docs/superpowers/specs/2026-06-05-ai-api-bridge-design.md`
 - Plan: `docs/superpowers/plans/2026-06-05-ai-api-bridge.md`
+## CI / Release
+- CI (`.github/workflows/ci.yml`): test + fmt + clippy + build on every push/PR to `main`.
+- Release (`.github/workflows/release.yml`): push a `v*` tag → cross builds x86_64 + aarch64 musl static binaries, packages as `.tar.gz`, creates a GitHub Release with changelog.
+- Cross-compile locally: `cross build --release --target x86_64-unknown-linux-musl` (x86_64) or `aarch64-unknown-linux-musl` (ARM64). See `Cross.toml`.

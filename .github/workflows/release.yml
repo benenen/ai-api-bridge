@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (${{ matrix.target }})
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/ai-api-bridge"
+          tar -czf "ai-api-bridge-${{ matrix.target }}.tar.gz" -C "$(dirname "$binary")" "$(basename "$binary")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-api-bridge-${{ matrix.target }}
+          path: ai-api-bridge-${{ matrix.target }}.tar.gz
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ai-api-bridge-*
+          merge-multiple: true
+
+      - name: Generate changelog
+        run: |
+          prev_tag=$(git tag --sort=-creatordate | head -2 | tail -1)
+          if [ -n "$prev_tag" ]; then
+            git log "${prev_tag}..HEAD" --pretty=format:'- %s' > CHANGELOG.txt
+          else
+            git log --pretty=format:'- %s' > CHANGELOG.txt
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ai-api-bridge-*.tar.gz
+          body_path: CHANGELOG.txt
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}

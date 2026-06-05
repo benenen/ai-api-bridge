@@ -1,0 +1,10 @@
+# cross configuration for ai-api-bridge
+# Build locally: cross build --release --target x86_64-unknown-linux-musl
+#
+# Uses rustls (no OpenSSL), so the default cross Docker image is sufficient.
+
+[target.x86_64-unknown-linux-musl]
+# Fully static binary — runs on any glibc or musl Linux distro.
+
+[target.aarch64-unknown-linux-musl]
+# ARM64 static binary — for AWS Graviton, Raspberry Pi 4/5 (64-bit), etc.
