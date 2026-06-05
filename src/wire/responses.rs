@@ -22,11 +22,14 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest, BridgeError> {
         .map(|s| s.to_string());
 
     let mut messages = Vec::new();
+    // Reasoning items precede the assistant turn they belong to; stash the most
+    // recent one and attach it to the next assistant message/function_call.
+    let mut pending_reasoning: Option<String> = None;
     match obj.get("input") {
         Some(Value::String(s)) => messages.push(Message::User(s.clone())),
         Some(Value::Array(items)) => {
             for item in items {
-                parse_input_item(item, &mut messages, &mut system);
+                parse_input_item(item, &mut messages, &mut system, &mut pending_reasoning);
             }
         }
         Some(_) => return Err(BridgeError::BadRequest("`input` must be string or array".into())),
@@ -61,7 +64,12 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest, BridgeError> {
     })
 }
 
-fn parse_input_item(item: &Value, messages: &mut Vec<Message>, system: &mut Option<String>) {
+fn parse_input_item(
+    item: &Value,
+    messages: &mut Vec<Message>,
+    system: &mut Option<String>,
+    pending_reasoning: &mut Option<String>,
+) {
     let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("message");
     match kind {
         "message" => {
@@ -69,8 +77,19 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Message>, system: &mut Opti
             let text = extract_text(item.get("content"));
             match role {
                 "system" | "developer" => append_system(system, &text),
-                "assistant" => messages.push(Message::Assistant { text: Some(text), reasoning_content: None, tool_calls: vec![] }),
-                _ => messages.push(Message::User(text)),
+                // An assistant preamble message opens the assistant turn; it owns
+                // any reasoning that preceded it. A following function_call in the
+                // same turn merges into this message.
+                "assistant" => messages.push(Message::Assistant {
+                    text: Some(text),
+                    reasoning_content: pending_reasoning.take(),
+                    tool_calls: vec![],
+                }),
+                // A user turn starts; any unconsumed reasoning is orphaned.
+                _ => {
+                    *pending_reasoning = None;
+                    messages.push(Message::User(text));
+                }
             }
         }
         "function_call" => {
@@ -79,10 +98,22 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Message>, system: &mut Opti
                 name: str_field(item, "name"),
                 arguments: str_field(item, "arguments"),
             };
-            if let Some(Message::Assistant { tool_calls, .. }) = messages.last_mut() {
-                tool_calls.push(call);
-            } else {
-                messages.push(Message::Assistant { text: None, reasoning_content: None, tool_calls: vec![call] });
+            match messages.last_mut() {
+                // Same assistant turn (opened by a preamble message or an earlier
+                // function_call): append the call, and adopt pending reasoning if
+                // this assistant doesn't have any yet.
+                Some(Message::Assistant { tool_calls, reasoning_content, .. }) => {
+                    tool_calls.push(call);
+                    if reasoning_content.is_none() {
+                        *reasoning_content = pending_reasoning.take();
+                    }
+                }
+                // The function_call opens a fresh assistant turn.
+                _ => messages.push(Message::Assistant {
+                    text: None,
+                    reasoning_content: pending_reasoning.take(),
+                    tool_calls: vec![call],
+                }),
             }
         }
         "function_call_output" => {
@@ -91,10 +122,11 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Message>, system: &mut Opti
                 Some(other) => other.to_string(),
                 None => String::new(),
             };
+            // The tool result ends the assistant turn; drop any unconsumed reasoning.
+            *pending_reasoning = None;
             messages.push(Message::Tool { call_id: str_field(item, "call_id"), output });
         }
-        // Attach reasoning text to the preceding assistant message so it
-        // can be echoed back to providers that require it (e.g. DeepSeek).
+        // Stash reasoning to attach to the assistant turn that follows it.
         "reasoning" => {
             let text = item
                 .get("summary")
@@ -107,11 +139,7 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Message>, system: &mut Opti
                 })
                 .unwrap_or_default();
             if !text.is_empty() {
-                if let Some(Message::Assistant { reasoning_content, .. }) = messages.last_mut() {
-                    *reasoning_content = Some(text);
-                } else {
-                    messages.push(Message::Assistant { text: Some(String::new()), reasoning_content: Some(text), tool_calls: vec![] });
-                }
+                *pending_reasoning = Some(text);
             }
         }
         _ => {}
@@ -505,6 +533,56 @@ mod tests {
     fn rejects_missing_model() {
         let err = parse_request(&json!({"input": "x"})).unwrap_err();
         assert!(matches!(err, crate::error::BridgeError::BadRequest(_)));
+    }
+
+    #[test]
+    fn reasoning_preamble_and_tool_call_merge_into_one_assistant() {
+        // A single assistant turn replayed by Codex as: reasoning, a short preamble
+        // message, then the function_call. The reasoning must land on the SAME
+        // assistant that carries the tool call (DeepSeek thinking mode requires it),
+        // and there must be exactly one assistant message (no spurious split).
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "do it"}]},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "I will run ls"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Let me check."}]},
+                {"type": "function_call", "call_id": "c1", "name": "exec", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+            ]
+        });
+        let req = parse_request(&body).unwrap();
+        let assistants: Vec<_> = req.messages.iter().filter_map(|m| match m {
+            Message::Assistant { text, reasoning_content, tool_calls } => Some((text, reasoning_content, tool_calls)),
+            _ => None,
+        }).collect();
+        assert_eq!(assistants.len(), 1, "reasoning + preamble + tool_call must be ONE assistant, got {}", assistants.len());
+        let (text, reasoning_content, tool_calls) = assistants[0];
+        assert_eq!(tool_calls.len(), 1, "the tool call must be on the assistant");
+        assert_eq!(text.as_deref(), Some("Let me check."));
+        assert_eq!(reasoning_content.as_deref(), Some("I will run ls"),
+            "reasoning_content must be on the tool-call assistant");
+    }
+
+    #[test]
+    fn reasoning_then_function_call_carries_reasoning() {
+        // No preamble: reasoning directly followed by a tool call.
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "step one"}]},
+                {"type": "function_call", "call_id": "c1", "name": "exec", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+            ]
+        });
+        let req = parse_request(&body).unwrap();
+        let a = req.messages.iter().find_map(|m| match m {
+            Message::Assistant { reasoning_content, tool_calls, .. } => Some((reasoning_content, tool_calls)),
+            _ => None,
+        }).expect("assistant");
+        assert_eq!(a.1.len(), 1);
+        assert_eq!(a.0.as_deref(), Some("step one"));
     }
 
     use crate::canonical::CanonicalEvent::*;
