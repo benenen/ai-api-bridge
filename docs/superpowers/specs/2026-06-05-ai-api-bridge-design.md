@@ -194,7 +194,7 @@ preserved from upstream when present, else generated.
 ## 7. Config (`config.rs`) — `bridge.toml`
 
 ```toml
-listen = "127.0.0.1:8787"
+listen = "127.0.0.1:8282"
 default_provider = "zen"
 # auth_token = "..."   # optional bearer the bridge requires from clients; omitted = accept any
 
@@ -331,7 +331,7 @@ model = "gpt-5.5"
 
 [model_providers.bridge]
 name = "bridge"
-base_url = "http://127.0.0.1:8787/v1"
+base_url = "http://127.0.0.1:8282/v1"
 wire_api = "responses"
 env_key = "BRIDGE_KEY"   # value ignored unless bridge auth_token is set
 ```
