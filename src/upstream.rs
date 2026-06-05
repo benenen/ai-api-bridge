@@ -14,7 +14,9 @@ pub struct Upstream {
 
 impl Upstream {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::new() }
+        Self {
+            client: reqwest::Client::new(),
+        }
     }
 
     fn request(&self, provider: &Provider, path: &str, body: &Value) -> reqwest::RequestBuilder {
@@ -44,7 +46,10 @@ impl Upstream {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(BridgeError::Upstream { status: status.as_u16(), message: truncate(&text, 500) });
+            return Err(BridgeError::Upstream {
+                status: status.as_u16(),
+                message: truncate(&text, 500),
+            });
         }
         Ok(resp.bytes_stream())
     }
@@ -64,9 +69,13 @@ impl Upstream {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(BridgeError::Upstream { status: status.as_u16(), message: truncate(&text, 500) });
+            return Err(BridgeError::Upstream {
+                status: status.as_u16(),
+                message: truncate(&text, 500),
+            });
         }
-        serde_json::from_str(&text).map_err(|e| BridgeError::Internal(format!("bad upstream JSON: {e}")))
+        serde_json::from_str(&text)
+            .map_err(|e| BridgeError::Internal(format!("bad upstream JSON: {e}")))
     }
 }
 

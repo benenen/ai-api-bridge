@@ -21,8 +21,15 @@ pub struct CanonicalRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     User(String),
-    Assistant { text: Option<String>, reasoning_content: Option<String>, tool_calls: Vec<ToolCall> },
-    Tool { call_id: String, output: String },
+    Assistant {
+        text: Option<String>,
+        reasoning_content: Option<String>,
+        tool_calls: Vec<ToolCall>,
+    },
+    Tool {
+        call_id: String,
+        output: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,15 +91,38 @@ impl ReasoningEffort {
 /// Provider-neutral streaming events. Both wire formats serialize to/from this.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CanonicalEvent {
-    Created { response_id: String, model: String },
-    ReasoningDelta { text: String },
-    TextDelta { text: String },
-    ToolCallStart { index: u32, call_id: String, name: String },
-    ToolCallArgsDelta { index: u32, delta: String },
-    ToolCallDone { index: u32 },
-    Usage { input_tokens: u32, output_tokens: u32, total_tokens: u32 },
+    Created {
+        response_id: String,
+        model: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    TextDelta {
+        text: String,
+    },
+    ToolCallStart {
+        index: u32,
+        call_id: String,
+        name: String,
+    },
+    ToolCallArgsDelta {
+        index: u32,
+        delta: String,
+    },
+    ToolCallDone {
+        index: u32,
+    },
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+        total_tokens: u32,
+    },
     Completed,
-    Error { message: String, status: u16 },
+    Error {
+        message: String,
+        status: u16,
+    },
 }
 
 #[cfg(test)]
@@ -101,7 +131,10 @@ mod tests {
 
     #[test]
     fn reasoning_effort_roundtrip() {
-        assert_eq!(ReasoningEffort::from_str_opt("xhigh"), Some(ReasoningEffort::XHigh));
+        assert_eq!(
+            ReasoningEffort::from_str_opt("xhigh"),
+            Some(ReasoningEffort::XHigh)
+        );
         assert_eq!(ReasoningEffort::XHigh.as_str(), "xhigh");
         assert_eq!(ReasoningEffort::from_str_opt("bogus"), None);
     }

@@ -2,12 +2,12 @@
 
 use std::sync::Arc;
 
-use axum::routing::post;
 use axum::Router;
+use axum::routing::post;
 use serde_json::json;
 
 use ai_api_bridge::config::Config;
-use ai_api_bridge::server::{build_app, AppState};
+use ai_api_bridge::server::{AppState, build_app};
 use ai_api_bridge::upstream::Upstream;
 
 // A mock upstream that replays a fixed Chat Completions SSE stream.
@@ -57,7 +57,11 @@ model_prefix = "opencode/"
 "#
     ))
     .unwrap();
-    let bridge_url = spawn(build_app(Arc::new(AppState { config: cfg, upstream: Upstream::new() }))).await;
+    let bridge_url = spawn(build_app(Arc::new(AppState {
+        config: cfg,
+        upstream: Upstream::new(),
+    })))
+    .await;
 
     let resp = reqwest::Client::new()
         .post(format!("{bridge_url}/v1/responses"))
@@ -83,7 +87,11 @@ async fn inband_upstream_error_becomes_response_failed() {
         "default_provider=\"zen\"\n[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"{upstream_url}\"\nmodel_prefix=\"opencode/\""
     ))
     .unwrap();
-    let bridge_url = spawn(build_app(Arc::new(AppState { config: cfg, upstream: Upstream::new() }))).await;
+    let bridge_url = spawn(build_app(Arc::new(AppState {
+        config: cfg,
+        upstream: Upstream::new(),
+    })))
+    .await;
     let resp = reqwest::Client::new()
         .post(format!("{bridge_url}/v1/responses"))
         .json(&json!({"model": "gpt-5.5", "input": "hi", "stream": true}))
@@ -91,15 +99,24 @@ async fn inband_upstream_error_becomes_response_failed() {
         .await
         .unwrap();
     let text = resp.text().await.unwrap();
-    assert!(text.contains("event: response.failed"), "expected response.failed, got: {text}");
+    assert!(
+        text.contains("event: response.failed"),
+        "expected response.failed, got: {text}"
+    );
     assert!(text.contains("rate limited"));
     assert!(!text.contains("event: response.completed"));
 }
 
 #[tokio::test]
 async fn unknown_model_returns_400() {
-    let cfg = Config::from_toml("[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"http://127.0.0.1:1\"").unwrap();
-    let bridge_url = spawn(build_app(Arc::new(AppState { config: cfg, upstream: Upstream::new() }))).await;
+    let cfg =
+        Config::from_toml("[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"http://127.0.0.1:1\"")
+            .unwrap();
+    let bridge_url = spawn(build_app(Arc::new(AppState {
+        config: cfg,
+        upstream: Upstream::new(),
+    })))
+    .await;
     let resp = reqwest::Client::new()
         .post(format!("{bridge_url}/v1/responses"))
         .json(&json!({"model": "nope", "input": "x"}))
@@ -115,7 +132,11 @@ async fn lists_models() {
         "default_provider=\"zen\"\n[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"u\"\n[[routes]]\nalias=\"fast\"\nprovider=\"zen\"\nmodel=\"opencode/x\"",
     )
     .unwrap();
-    let url = spawn(build_app(Arc::new(AppState { config: cfg, upstream: Upstream::new() }))).await;
+    let url = spawn(build_app(Arc::new(AppState {
+        config: cfg,
+        upstream: Upstream::new(),
+    })))
+    .await;
     let body: serde_json::Value = reqwest::get(format!("{url}/v1/models"))
         .await
         .unwrap()
@@ -123,13 +144,23 @@ async fn lists_models() {
         .await
         .unwrap();
     assert_eq!(body["object"], "list");
-    assert!(body["data"].as_array().unwrap().iter().any(|m| m["id"] == "fast"));
+    assert!(
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "fast")
+    );
 }
 
 #[tokio::test]
 async fn messages_endpoint_returns_501() {
     let cfg = Config::from_toml("[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"u\"").unwrap();
-    let url = spawn(build_app(Arc::new(AppState { config: cfg, upstream: Upstream::new() }))).await;
+    let url = spawn(build_app(Arc::new(AppState {
+        config: cfg,
+        upstream: Upstream::new(),
+    })))
+    .await;
     let resp = reqwest::Client::new()
         .post(format!("{url}/v1/messages"))
         .json(&json!({}))

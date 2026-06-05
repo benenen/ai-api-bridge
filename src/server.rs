@@ -4,6 +4,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use async_stream::stream;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, Sse};
@@ -11,8 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{Stream, StreamExt};
-use axum::body::Body;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::canonical::CanonicalEvent;
 use crate::config::Config;
@@ -52,7 +52,9 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), BridgeError> 
     if got == Some(expected.as_str()) {
         Ok(())
     } else {
-        Err(BridgeError::Unauthorized("invalid bridge auth token".into()))
+        Err(BridgeError::Unauthorized(
+            "invalid bridge auth token".into(),
+        ))
     }
 }
 

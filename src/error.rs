@@ -1,8 +1,8 @@
 //! Bridge error type; maps to an HTTP status + a client-format error body.
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
 
 #[derive(Debug, thiserror::Error)]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use clap::Parser;
 
 use ai_api_bridge::config::Config;
-use ai_api_bridge::server::{build_app, AppState};
+use ai_api_bridge::server::{AppState, build_app};
 use ai_api_bridge::upstream::Upstream;
 
 #[derive(Parser, Debug)]
@@ -34,7 +34,10 @@ async fn main() -> anyhow::Result<()> {
     }
     let addr = config.listen.clone();
 
-    let state = Arc::new(AppState { config, upstream: Upstream::new() });
+    let state = Arc::new(AppState {
+        config,
+        upstream: Upstream::new(),
+    });
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

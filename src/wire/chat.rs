@@ -1,6 +1,6 @@
 //! OpenAI Chat Completions wire format — outbound (client) side.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::canonical::*;
 use crate::config::Provider;
@@ -14,21 +14,30 @@ pub fn build_request(req: &CanonicalRequest, upstream_model: &str, provider: &Pr
     for m in &req.messages {
         match m {
             Message::User(text) => messages.push(json!({"role": "user", "content": text})),
-            Message::Assistant { text, reasoning_content, tool_calls } => {
+            Message::Assistant {
+                text,
+                reasoning_content,
+                tool_calls,
+            } => {
                 let mut obj = Map::new();
                 obj.insert("role".into(), json!("assistant"));
-                obj.insert("content".into(), text.clone().map(Value::String).unwrap_or(Value::Null));
+                obj.insert(
+                    "content".into(),
+                    text.clone().map(Value::String).unwrap_or(Value::Null),
+                );
                 if let Some(rc) = reasoning_content {
                     obj.insert("reasoning_content".into(), json!(rc));
                 }
                 if !tool_calls.is_empty() {
                     let tcs: Vec<Value> = tool_calls
                         .iter()
-                        .map(|tc| json!({
-                            "id": tc.call_id,
-                            "type": "function",
-                            "function": {"name": tc.name, "arguments": tc.arguments}
-                        }))
+                        .map(|tc| {
+                            json!({
+                                "id": tc.call_id,
+                                "type": "function",
+                                "function": {"name": tc.name, "arguments": tc.arguments}
+                            })
+                        })
                         .collect();
                     obj.insert("tool_calls".into(), json!(tcs));
                 }
@@ -96,16 +105,31 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest, BridgeError> {
     if let Some(arr) = obj.get("messages").and_then(|v| v.as_array()) {
         for m in arr {
             let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-            let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let content = m
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             match role {
                 "system" | "developer" => system = Some(content),
                 "tool" => messages.push(Message::Tool {
-                    call_id: m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    call_id: m
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     output: content,
                 }),
                 "assistant" => {
-                    let rc = m.get("reasoning_content").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    messages.push(Message::Assistant { text: Some(content), reasoning_content: rc, tool_calls: vec![] })
+                    let rc = m
+                        .get("reasoning_content")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    messages.push(Message::Assistant {
+                        text: Some(content),
+                        reasoning_content: rc,
+                        tool_calls: vec![],
+                    })
                 }
                 _ => messages.push(Message::User(content)),
             }
@@ -118,9 +142,15 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest, BridgeError> {
         messages,
         tools: vec![],
         tool_choice: ToolChoice::Auto,
-        temperature: obj.get("temperature").and_then(|v| v.as_f64()).map(|f| f as f32),
+        temperature: obj
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .map(|f| f as f32),
         top_p: None,
-        max_output_tokens: obj.get("max_tokens").and_then(|v| v.as_u64()).map(|n| n as u32),
+        max_output_tokens: obj
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
         reasoning_effort: None,
         parallel_tool_calls: None,
         stream,
@@ -149,28 +179,35 @@ pub struct ChatStreamParser {
 
 impl ChatStreamParser {
     pub fn new(response_id: String) -> Self {
-        Self { response_id, ..Default::default() }
+        Self {
+            response_id,
+            ..Default::default()
+        }
     }
 
     pub fn on_chunk(&mut self, chunk: &Value) -> Vec<CanonicalEvent> {
-        if let Some(err) = chunk.get("error") {
-            if !err.is_null() {
-                let message = err
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("upstream error")
-                    .to_string();
-                let status = err
-                    .get("code")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u16)
-                    .unwrap_or(502);
-                return vec![CanonicalEvent::Error { message, status }];
-            }
+        if let Some(err) = chunk.get("error")
+            && !err.is_null()
+        {
+            let message = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("upstream error")
+                .to_string();
+            let status = err
+                .get("code")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u16)
+                .unwrap_or(502);
+            return vec![CanonicalEvent::Error { message, status }];
         }
         let mut events = Vec::new();
         if !self.created {
-            self.model = chunk.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            self.model = chunk
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             events.push(CanonicalEvent::Created {
                 response_id: self.response_id.clone(),
                 model: self.model.clone(),
@@ -189,37 +226,60 @@ impl ChatStreamParser {
                     .get("reasoning_content")
                     .or_else(|| delta.get("reasoning"))
                     .and_then(|v| v.as_str())
+                    && !rc.is_empty()
                 {
-                    if !rc.is_empty() {
-                        events.push(CanonicalEvent::ReasoningDelta { text: rc.to_string() });
-                    }
+                    events.push(CanonicalEvent::ReasoningDelta {
+                        text: rc.to_string(),
+                    });
                 }
-                if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
-                    if !c.is_empty() {
-                        events.push(CanonicalEvent::TextDelta { text: c.to_string() });
-                    }
+                if let Some(c) = delta.get("content").and_then(|v| v.as_str())
+                    && !c.is_empty()
+                {
+                    events.push(CanonicalEvent::TextDelta {
+                        text: c.to_string(),
+                    });
                 }
                 if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                     for tc in tcs {
                         let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                         if !self.started_tools.contains(&index) {
-                            let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let name = tc.get("function").and_then(|f| f.get("name"))
-                                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let call_id = tc
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = tc
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             self.started_tools.insert(index);
-                            events.push(CanonicalEvent::ToolCallStart { index, call_id, name });
+                            events.push(CanonicalEvent::ToolCallStart {
+                                index,
+                                call_id,
+                                name,
+                            });
                         }
-                        if let Some(args) = tc.get("function").and_then(|f| f.get("arguments"))
+                        if let Some(args) = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
                             .and_then(|v| v.as_str())
+                            && !args.is_empty()
                         {
-                            if !args.is_empty() {
-                                events.push(CanonicalEvent::ToolCallArgsDelta { index, delta: args.to_string() });
-                            }
+                            events.push(CanonicalEvent::ToolCallArgsDelta {
+                                index,
+                                delta: args.to_string(),
+                            });
                         }
                     }
                 }
             }
-            if choice.get("finish_reason").and_then(|v| v.as_str()).is_some() {
+            if choice
+                .get("finish_reason")
+                .and_then(|v| v.as_str())
+                .is_some()
+            {
                 let mut idxs: Vec<u32> = self.started_tools.iter().copied().collect();
                 idxs.sort_unstable();
                 for i in idxs {
@@ -228,10 +288,10 @@ impl ChatStreamParser {
             }
         }
 
-        if let Some(u) = chunk.get("usage") {
-            if !u.is_null() {
-                events.push(usage_event(u));
-            }
+        if let Some(u) = chunk.get("usage")
+            && !u.is_null()
+        {
+            events.push(usage_event(u));
         }
         events
     }
@@ -240,8 +300,15 @@ impl ChatStreamParser {
 /// Translate a full (non-streaming) Chat Completions response into canonical events.
 pub fn completion_to_events(resp: &Value, response_id: &str) -> Vec<CanonicalEvent> {
     let mut events = Vec::new();
-    let model = resp.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    events.push(CanonicalEvent::Created { response_id: response_id.to_string(), model });
+    let model = resp
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    events.push(CanonicalEvent::Created {
+        response_id: response_id.to_string(),
+        model,
+    });
 
     if let Some(msg) = resp
         .get("choices")
@@ -249,23 +316,48 @@ pub fn completion_to_events(resp: &Value, response_id: &str) -> Vec<CanonicalEve
         .and_then(|a| a.first())
         .and_then(|c| c.get("message"))
     {
-        if let Some(rc) = msg.get("reasoning_content").or_else(|| msg.get("reasoning")).and_then(|v| v.as_str()) {
-            if !rc.is_empty() {
-                events.push(CanonicalEvent::ReasoningDelta { text: rc.to_string() });
-            }
+        if let Some(rc) = msg
+            .get("reasoning_content")
+            .or_else(|| msg.get("reasoning"))
+            .and_then(|v| v.as_str())
+            && !rc.is_empty()
+        {
+            events.push(CanonicalEvent::ReasoningDelta {
+                text: rc.to_string(),
+            });
         }
-        if let Some(c) = msg.get("content").and_then(|v| v.as_str()) {
-            if !c.is_empty() {
-                events.push(CanonicalEvent::TextDelta { text: c.to_string() });
-            }
+        if let Some(c) = msg.get("content").and_then(|v| v.as_str())
+            && !c.is_empty()
+        {
+            events.push(CanonicalEvent::TextDelta {
+                text: c.to_string(),
+            });
         }
         if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
             for (i, tc) in tcs.iter().enumerate() {
                 let index = i as u32;
-                let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                events.push(CanonicalEvent::ToolCallStart { index, call_id, name });
+                let call_id = tc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                events.push(CanonicalEvent::ToolCallStart {
+                    index,
+                    call_id,
+                    name,
+                });
                 if !args.is_empty() {
                     events.push(CanonicalEvent::ToolCallArgsDelta { index, delta: args });
                 }
@@ -274,10 +366,10 @@ pub fn completion_to_events(resp: &Value, response_id: &str) -> Vec<CanonicalEve
         }
     }
 
-    if let Some(u) = resp.get("usage") {
-        if !u.is_null() {
-            events.push(usage_event(u));
-        }
+    if let Some(u) = resp.get("usage")
+        && !u.is_null()
+    {
+        events.push(usage_event(u));
     }
     events.push(CanonicalEvent::Completed);
     events
@@ -286,7 +378,10 @@ pub fn completion_to_events(resp: &Value, response_id: &str) -> Vec<CanonicalEve
 fn usage_event(u: &Value) -> CanonicalEvent {
     CanonicalEvent::Usage {
         input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        output_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        output_tokens: u
+            .get("completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
         total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
     }
 }
@@ -316,11 +411,25 @@ mod tests {
             system: Some("sys".into()),
             messages: vec![
                 Message::User("hi".into()),
-                Message::Assistant { text: None, reasoning_content: None, tool_calls: vec![ToolCall {
-                    call_id: "c1".into(), name: "f".into(), arguments: "{}".into() }] },
-                Message::Tool { call_id: "c1".into(), output: "ok".into() },
+                Message::Assistant {
+                    text: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        call_id: "c1".into(),
+                        name: "f".into(),
+                        arguments: "{}".into(),
+                    }],
+                },
+                Message::Tool {
+                    call_id: "c1".into(),
+                    output: "ok".into(),
+                },
             ],
-            tools: vec![ToolDef { name: "f".into(), description: Some("d".into()), parameters: json!({"type":"object"}) }],
+            tools: vec![ToolDef {
+                name: "f".into(),
+                description: Some("d".into()),
+                parameters: json!({"type":"object"}),
+            }],
             tool_choice: ToolChoice::Required,
             temperature: Some(0.5),
             top_p: None,
@@ -333,7 +442,10 @@ mod tests {
         assert_eq!(body["model"], "opencode/gpt-5.5");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
-        assert_eq!(body["messages"][2]["tool_calls"][0]["function"]["name"], "f");
+        assert_eq!(
+            body["messages"][2]["tool_calls"][0]["function"]["name"],
+            "f"
+        );
         assert_eq!(body["messages"][3]["role"], "tool");
         assert_eq!(body["messages"][3]["tool_call_id"], "c1");
         assert_eq!(body["tools"][0]["function"]["name"], "f");
@@ -349,9 +461,17 @@ mod tests {
         let mut p = provider();
         p.max_tokens_field = "max_completion_tokens".into();
         let req = CanonicalRequest {
-            model: "m".into(), system: None, messages: vec![Message::User("x".into())],
-            tools: vec![], tool_choice: ToolChoice::Auto, temperature: None, top_p: None,
-            max_output_tokens: Some(42), reasoning_effort: None, parallel_tool_calls: None, stream: false,
+            model: "m".into(),
+            system: None,
+            messages: vec![Message::User("x".into())],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: Some(42),
+            reasoning_effort: None,
+            parallel_tool_calls: None,
+            stream: false,
         };
         let body = build_request(&req, "m", &p);
         assert_eq!(body["max_completion_tokens"], 42);
@@ -368,10 +488,23 @@ mod tests {
         evs.extend(p.on_chunk(&json!({"choices":[],
             "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}})));
         use CanonicalEvent::*;
-        assert_eq!(evs[0], Created { response_id: "resp_x".into(), model: "opencode/gpt-5.5".into() });
+        assert_eq!(
+            evs[0],
+            Created {
+                response_id: "resp_x".into(),
+                model: "opencode/gpt-5.5".into()
+            }
+        );
         assert_eq!(evs[1], TextDelta { text: "Hel".into() });
         assert_eq!(evs[2], TextDelta { text: "lo".into() });
-        assert_eq!(evs.last().unwrap(), &Usage { input_tokens: 3, output_tokens: 2, total_tokens: 5 });
+        assert_eq!(
+            evs.last().unwrap(),
+            &Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+                total_tokens: 5
+            }
+        );
     }
 
     #[test]
@@ -383,9 +516,19 @@ mod tests {
             {"index":0,"function":{"arguments":":1}"}}]}}]})));
         evs.extend(p.on_chunk(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})));
         use CanonicalEvent::*;
-        assert!(evs.contains(&ToolCallStart { index: 0, call_id: "call_1".into(), name: "get".into() }));
-        assert!(evs.contains(&ToolCallArgsDelta { index: 0, delta: "{\"a\"".into() }));
-        assert!(evs.contains(&ToolCallArgsDelta { index: 0, delta: ":1}".into() }));
+        assert!(evs.contains(&ToolCallStart {
+            index: 0,
+            call_id: "call_1".into(),
+            name: "get".into()
+        }));
+        assert!(evs.contains(&ToolCallArgsDelta {
+            index: 0,
+            delta: "{\"a\"".into()
+        }));
+        assert!(evs.contains(&ToolCallArgsDelta {
+            index: 0,
+            delta: ":1}".into()
+        }));
         assert!(evs.contains(&ToolCallDone { index: 0 }));
     }
 
@@ -394,7 +537,13 @@ mod tests {
         let mut p = ChatStreamParser::new("r".into());
         let evs = p.on_chunk(&json!({"error":{"message":"rate limited","code":429}}));
         use CanonicalEvent::*;
-        assert_eq!(evs, vec![Error { message: "rate limited".into(), status: 429 }]);
+        assert_eq!(
+            evs,
+            vec![Error {
+                message: "rate limited".into(),
+                status: 429
+            }]
+        );
     }
 
     #[test]
@@ -418,9 +567,19 @@ mod tests {
             "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
         let evs = completion_to_events(&resp, "r1");
         use CanonicalEvent::*;
-        assert_eq!(evs.first().unwrap(), &Created { response_id: "r1".into(), model: "m".into() });
+        assert_eq!(
+            evs.first().unwrap(),
+            &Created {
+                response_id: "r1".into(),
+                model: "m".into()
+            }
+        );
         assert!(evs.contains(&TextDelta { text: "hi".into() }));
-        assert!(evs.contains(&ToolCallStart { index: 0, call_id: "c".into(), name: "f".into() }));
+        assert!(evs.contains(&ToolCallStart {
+            index: 0,
+            call_id: "c".into(),
+            name: "f".into()
+        }));
         assert_eq!(evs.last().unwrap(), &Completed);
     }
 }

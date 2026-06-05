@@ -83,10 +83,13 @@ mod tests {
         let mut d = SseDecoder::default();
         let mut items = d.push(b"data: {\"a\":1}\n\ndata: {\"b\"");
         items.extend(d.push(b":2}\n\n"));
-        assert_eq!(items, vec![
-            SseItem::Data("{\"a\":1}".into()),
-            SseItem::Data("{\"b\":2}".into()),
-        ]);
+        assert_eq!(
+            items,
+            vec![
+                SseItem::Data("{\"a\":1}".into()),
+                SseItem::Data("{\"b\":2}".into()),
+            ]
+        );
     }
 
     #[test]

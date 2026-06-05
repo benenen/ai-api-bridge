@@ -13,7 +13,10 @@ pub struct Resolved<'a> {
 pub fn resolve<'a>(cfg: &'a Config, alias: &str) -> Result<Resolved<'a>, BridgeError> {
     if let Some(route) = cfg.routes.iter().find(|r| r.alias == alias) {
         let provider = cfg.providers.get(&route.provider).ok_or_else(|| {
-            BridgeError::Internal(format!("route references unknown provider {}", route.provider))
+            BridgeError::Internal(format!(
+                "route references unknown provider {}",
+                route.provider
+            ))
         })?;
         return Ok(Resolved {
             provider_name: route.provider.clone(),
@@ -33,7 +36,11 @@ pub fn resolve<'a>(cfg: &'a Config, alias: &str) -> Result<Resolved<'a>, BridgeE
         Some(prefix) if !alias.contains('/') => format!("{prefix}{alias}"),
         _ => alias.to_string(),
     };
-    Ok(Resolved { provider_name, provider, upstream_model })
+    Ok(Resolved {
+        provider_name,
+        provider,
+        upstream_model,
+    })
 }
 
 #[cfg(test)]
