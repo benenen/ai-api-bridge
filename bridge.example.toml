@@ -1,0 +1,18 @@
+# Copy to bridge.toml. Provide your OpenCode Zen key via the environment
+# variable BRIDGE_PROVIDERS_ZEN_API_KEY (preferred), or set an `api_key` field
+# under [providers.zen] inline.
+listen = "127.0.0.1:8282"
+default_provider = "zen"
+# auth_token = "set-me-to-require-a-bearer-token-from-clients"
+
+[providers.zen]
+wire = "openai-chat"
+base_url = "https://opencode.ai/zen/v1"
+model_prefix = "opencode/"          # gpt-5.5 -> opencode/gpt-5.5
+# max_tokens_field = "max_tokens"   # or "max_completion_tokens"
+
+# Optional explicit alias overrides:
+# [[routes]]
+# alias = "gpt-5.5"
+# provider = "zen"
+# model = "opencode/gpt-5.5"
