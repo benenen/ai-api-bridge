@@ -3,11 +3,15 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this is
-A local format-translating AI API proxy. Clients speak the OpenAI **Responses API**
-(`POST /v1/responses`); the bridge translates to OpenAI **Chat Completions**
-(`/chat/completions`) against a configured upstream (OpenCode Zen) and translates the
-streaming response back. Purpose: use an OpenCode Zen account inside the Codex CLI
-(Codex only speaks `wire_api = "responses"`).
+A local format-translating AI API proxy that serves **two clients at once** from one
+upstream account:
+- **Codex** → `POST /v1/responses` (OpenAI Responses API)
+- **Claude Code** → `POST /v1/messages` (Anthropic Messages API, via `ANTHROPIC_BASE_URL`)
+
+Both are translated to OpenAI **Chat Completions** (`/chat/completions`) against a configured
+upstream (OpenCode Zen / the `go` package) and the streaming response is translated back. The
+two clients share the same `[[routes]]`, so one alias (e.g. `gpt-5.5 → go/deepseek-v4-pro`)
+backs both. Purpose: use an OpenCode Zen account inside both Codex and Claude Code.
 
 ## Commands
 - Build: `cargo build` (release: `cargo build --release`)

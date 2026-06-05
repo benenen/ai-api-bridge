@@ -1,6 +1,10 @@
 # ai-api-bridge configuration. Copy to `bridge.toml` and edit.
 # Full reference: docs/configuration.md
 #
+# One running bridge serves BOTH clients at once, sharing the [[routes]] below:
+#   - Codex       -> POST /v1/responses  (~/.codex/config.toml, wire_api="responses")
+#   - Claude Code -> POST /v1/messages   (ANTHROPIC_BASE_URL + ANTHROPIC_MODEL)
+#
 # Keys for a provider can be supplied inline (`api_key = "..."`) or — preferred —
 # via the environment variable BRIDGE_PROVIDERS_<NAME>_API_KEY, e.g.
 #   export BRIDGE_PROVIDERS_ZEN_API_KEY=...      # for [providers.zen]
@@ -8,8 +12,8 @@
 
 listen = "127.0.0.1:8282"
 default_provider = "zen"
-# Require clients to send `Authorization: Bearer <auth_token>` (Codex sends its
-# env_key value). Leave unset to accept any/no token.
+# Require clients to send the token: `Authorization: Bearer <auth_token>` (Codex's env_key)
+# or `x-api-key: <auth_token>` (Claude Code's ANTHROPIC_API_KEY). Unset = accept any/no token.
 # auth_token = "set-me-to-a-long-random-string"
 
 # ----------------------------------------------------------------------------

@@ -14,7 +14,16 @@ cargo run --release -- --config bridge.toml
 # listening on 127.0.0.1:8282
 ```
 
-Point Codex at it (`~/.codex/config.toml`):
+**One running bridge serves both Codex and Claude Code at the same time.** They hit different
+endpoints but share the same `[[routes]]`, so a single alias (`gpt-5.5 → go/deepseek-v4-pro`)
+backs both:
+
+| Client | Endpoint | Connect via | Model | Auth header |
+|---|---|---|---|---|
+| **Codex** | `/v1/responses` | `~/.codex/config.toml` (`wire_api = "responses"`) | `model = "gpt-5.5"` | `Authorization: Bearer` |
+| **Claude Code** | `/v1/messages` | `ANTHROPIC_BASE_URL` env | `ANTHROPIC_MODEL=gpt-5.5` | `x-api-key` |
+
+### Codex (`~/.codex/config.toml`)
 
 ```toml
 model_provider = "bridge"
@@ -31,7 +40,7 @@ env_key = "BRIDGE_KEY"   # value ignored unless `auth_token` is set in bridge.to
 BRIDGE_KEY=x codex
 ```
 
-Or point **Claude Code** at it (it speaks the Anthropic Messages API via `ANTHROPIC_BASE_URL`):
+### Claude Code (Anthropic Messages API via `ANTHROPIC_BASE_URL`)
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8282
@@ -50,7 +59,7 @@ claude
 ## Config
 See [`bridge.example.toml`](bridge.example.toml) for a working template and
 **[`docs/configuration.md`](docs/configuration.md) for the full reference** (every key,
-the `go` package model list, routing rules, and Codex setup).
+the `go` package model list, routing rules, and Codex + Claude Code setup).
 
 In short: keys are set inline (`api_key` under a provider) or via
 `BRIDGE_PROVIDERS_<NAME>_API_KEY` (e.g. `BRIDGE_PROVIDERS_GO_API_KEY`); model names map to

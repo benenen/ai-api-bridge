@@ -9,6 +9,20 @@ export BRIDGE_PROVIDERS_GO_API_KEY=...        # your go-package key
 cargo run --release -- --config bridge.toml   # listens on 127.0.0.1:8282
 ```
 
+## Clients — Codex and Claude Code at the same time
+
+One running bridge serves **both** clients simultaneously. They use different inbound
+endpoints (and different auth headers) but the **same `[[routes]]`**, so a single alias such
+as `gpt-5.5 → go/deepseek-v4-pro` backs both:
+
+| Client | Endpoint | Connect via | Model | Auth header |
+|---|---|---|---|---|
+| **Codex** | `POST /v1/responses` | `~/.codex/config.toml` (`wire_api = "responses"`) | `model` | `Authorization: Bearer` |
+| **Claude Code** | `POST /v1/messages` | `ANTHROPIC_BASE_URL` env var | `ANTHROPIC_MODEL` | `x-api-key` |
+
+Setup for each: [Pointing Codex at the bridge](#pointing-codex-at-the-bridge) ·
+[Pointing Claude Code at the bridge](#pointing-claude-code-at-the-bridge).
+
 ## Loading
 
 - The file is selected with `--config <path>` (default: `bridge.toml` in the working dir).
