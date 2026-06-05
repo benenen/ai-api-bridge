@@ -1,0 +1,8 @@
+target/
+.git/
+.github/
+*.md
+bridge.toml
+bridge.example.toml
+docs/
+tests/

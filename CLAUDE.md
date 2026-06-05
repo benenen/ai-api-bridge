@@ -70,3 +70,8 @@ wire-format directly:
 - CI (`.github/workflows/ci.yml`): test + fmt + clippy + build on every push/PR to `main`.
 - Release (`.github/workflows/release.yml`): push a `v*` tag → cross builds x86_64 + aarch64 musl static binaries, packages as `.tar.gz`, creates a GitHub Release with changelog.
 - Cross-compile locally: `cross build --release --target x86_64-unknown-linux-musl` (x86_64) or `aarch64-unknown-linux-musl` (ARM64). See `Cross.toml`.
+
+## Docker
+- Build locally: `docker build -t ai-api-bridge .`
+- Run: `docker run -d -p 8282:8282 -v ./bridge.toml:/etc/ai-api-bridge/bridge.toml ai-api-bridge`
+- Release workflow also pushes multi-arch (amd64 + arm64) images to `ghcr.io/<org>/ai-api-bridge`.
