@@ -52,7 +52,7 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), BridgeError> 
     if got == Some(expected.as_str()) {
         Ok(())
     } else {
-        Err(BridgeError::BadRequest("invalid bridge auth token".into()))
+        Err(BridgeError::Unauthorized("invalid bridge auth token".into()))
     }
 }
 

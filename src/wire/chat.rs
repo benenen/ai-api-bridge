@@ -288,7 +288,6 @@ fn usage_event(u: &Value) -> CanonicalEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::*;
     use crate::config::{Provider, WireName};
     use serde_json::json;
     use std::collections::HashMap;

@@ -208,6 +208,7 @@ pub struct ResponsesEmitter {
     tools: std::collections::BTreeMap<u32, ToolItem>,
     usage: Option<(u32, u32, u32)>,
     final_items: Vec<Value>,
+    seq: u64,
 }
 
 impl ResponsesEmitter {
@@ -272,18 +273,8 @@ impl ResponsesEmitter {
                 }
             }
             CanonicalEvent::ToolCallDone { index } => {
-                if let Some(t) = self.tools.get(index) {
-                    let item = json!({"type": "function_call", "id": t.id, "call_id": t.call_id,
-                        "name": t.name, "arguments": t.args, "status": "completed"});
-                    f.push(frame("response.function_call_arguments.done", json!({
-                        "type": "response.function_call_arguments.done",
-                        "item_id": t.id, "output_index": t.output_index, "arguments": t.args
-                    })));
-                    f.push(frame("response.output_item.done", json!({
-                        "type": "response.output_item.done",
-                        "output_index": t.output_index, "item": item.clone()
-                    })));
-                    self.final_items.push(item);
+                if let Some(t) = self.tools.remove(index) {
+                    self.finish_tool(&mut f, t);
                 }
             }
             CanonicalEvent::Usage { input_tokens, output_tokens, total_tokens } => {
@@ -292,6 +283,7 @@ impl ResponsesEmitter {
             CanonicalEvent::Completed => {
                 self.close_reasoning(&mut f);
                 self.close_message(&mut f);
+                self.close_open_tools(&mut f);
                 f.push(frame("response.completed", json!({
                     "type": "response.completed",
                     "response": self.completed_response()
@@ -304,6 +296,12 @@ impl ResponsesEmitter {
                         "error": {"code": status, "message": message}}
                 })));
             }
+        }
+        for fr in &mut f {
+            if let Value::Object(map) = &mut fr.data {
+                map.insert("sequence_number".into(), serde_json::json!(self.seq));
+            }
+            self.seq += 1;
         }
         f
     }
@@ -385,6 +383,27 @@ impl ResponsesEmitter {
         }
     }
 
+    fn finish_tool(&mut self, f: &mut Vec<SseFrame>, t: ToolItem) {
+        let item = json!({"type": "function_call", "id": t.id, "call_id": t.call_id,
+            "name": t.name, "arguments": t.args, "status": "completed"});
+        f.push(frame("response.function_call_arguments.done", json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": t.id, "output_index": t.output_index, "arguments": t.args
+        })));
+        f.push(frame("response.output_item.done", json!({
+            "type": "response.output_item.done",
+            "output_index": t.output_index, "item": item.clone()
+        })));
+        self.final_items.push(item);
+    }
+
+    fn close_open_tools(&mut self, f: &mut Vec<SseFrame>) {
+        let open: Vec<ToolItem> = std::mem::take(&mut self.tools).into_values().collect();
+        for t in open {
+            self.finish_tool(f, t);
+        }
+    }
+
     fn skeleton(&self, status: &str) -> Value {
         json!({"id": self.response_id, "object": "response", "status": status,
             "model": self.model, "output": []})
@@ -401,7 +420,6 @@ impl ResponsesEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::*;
     use serde_json::json;
 
     #[test]
@@ -524,5 +542,22 @@ mod tests {
         let resp = e.final_response();
         assert_eq!(resp["status"], "completed");
         assert_eq!(resp["output"][0]["content"][0]["text"], "ok");
+    }
+
+    #[test]
+    fn frames_carry_increasing_sequence_numbers() {
+        let mut e = ResponsesEmitter::new();
+        let mut frames = Vec::new();
+        frames.extend(e.on_event(&Created { response_id: "r".into(), model: "m".into() }));
+        frames.extend(e.on_event(&TextDelta { text: "hi".into() }));
+        frames.extend(e.on_event(&Completed));
+        let seqs: Vec<u64> = frames
+            .iter()
+            .map(|f| f.data["sequence_number"].as_u64().unwrap())
+            .collect();
+        assert!(!seqs.is_empty());
+        for (i, s) in seqs.iter().enumerate() {
+            assert_eq!(*s, i as u64, "sequence numbers must be 0,1,2,... in order");
+        }
     }
 }
