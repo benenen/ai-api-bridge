@@ -69,7 +69,7 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Message>, system: &mut Opti
             let text = extract_text(item.get("content"));
             match role {
                 "system" | "developer" => append_system(system, &text),
-                "assistant" => messages.push(Message::Assistant { text: Some(text), tool_calls: vec![] }),
+                "assistant" => messages.push(Message::Assistant { text: Some(text), reasoning_content: None, tool_calls: vec![] }),
                 _ => messages.push(Message::User(text)),
             }
         }
@@ -82,7 +82,7 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Message>, system: &mut Opti
             if let Some(Message::Assistant { tool_calls, .. }) = messages.last_mut() {
                 tool_calls.push(call);
             } else {
-                messages.push(Message::Assistant { text: None, tool_calls: vec![call] });
+                messages.push(Message::Assistant { text: None, reasoning_content: None, tool_calls: vec![call] });
             }
         }
         "function_call_output" => {
@@ -93,7 +93,27 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Message>, system: &mut Opti
             };
             messages.push(Message::Tool { call_id: str_field(item, "call_id"), output });
         }
-        // "reasoning" items are intentionally dropped (Chat Completions is stateless).
+        // Attach reasoning text to the preceding assistant message so it
+        // can be echoed back to providers that require it (e.g. DeepSeek).
+        "reasoning" => {
+            let text = item
+                .get("summary")
+                .and_then(|s| s.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| e.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            if !text.is_empty() {
+                if let Some(Message::Assistant { reasoning_content, .. }) = messages.last_mut() {
+                    *reasoning_content = Some(text);
+                } else {
+                    messages.push(Message::Assistant { text: None, reasoning_content: Some(text), tool_calls: vec![] });
+                }
+            }
+        }
         _ => {}
     }
 }

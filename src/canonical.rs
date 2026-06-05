@@ -21,7 +21,7 @@ pub struct CanonicalRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     User(String),
-    Assistant { text: Option<String>, tool_calls: Vec<ToolCall> },
+    Assistant { text: Option<String>, reasoning_content: Option<String>, tool_calls: Vec<ToolCall> },
     Tool { call_id: String, output: String },
 }
 

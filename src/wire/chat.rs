@@ -14,10 +14,13 @@ pub fn build_request(req: &CanonicalRequest, upstream_model: &str, provider: &Pr
     for m in &req.messages {
         match m {
             Message::User(text) => messages.push(json!({"role": "user", "content": text})),
-            Message::Assistant { text, tool_calls } => {
+            Message::Assistant { text, reasoning_content, tool_calls } => {
                 let mut obj = Map::new();
                 obj.insert("role".into(), json!("assistant"));
                 obj.insert("content".into(), text.clone().map(Value::String).unwrap_or(Value::Null));
+                if let Some(rc) = reasoning_content {
+                    obj.insert("reasoning_content".into(), json!(rc));
+                }
                 if !tool_calls.is_empty() {
                     let tcs: Vec<Value> = tool_calls
                         .iter()
@@ -100,7 +103,10 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest, BridgeError> {
                     call_id: m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     output: content,
                 }),
-                "assistant" => messages.push(Message::Assistant { text: Some(content), tool_calls: vec![] }),
+                "assistant" => {
+                    let rc = m.get("reasoning_content").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    messages.push(Message::Assistant { text: Some(content), reasoning_content: rc, tool_calls: vec![] })
+                }
                 _ => messages.push(Message::User(content)),
             }
         }
@@ -310,7 +316,7 @@ mod tests {
             system: Some("sys".into()),
             messages: vec![
                 Message::User("hi".into()),
-                Message::Assistant { text: None, tool_calls: vec![ToolCall {
+                Message::Assistant { text: None, reasoning_content: None, tool_calls: vec![ToolCall {
                     call_id: "c1".into(), name: "f".into(), arguments: "{}".into() }] },
                 Message::Tool { call_id: "c1".into(), output: "ok".into() },
             ],
