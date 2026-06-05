@@ -110,7 +110,7 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Message>, system: &mut Opti
                 if let Some(Message::Assistant { reasoning_content, .. }) = messages.last_mut() {
                     *reasoning_content = Some(text);
                 } else {
-                    messages.push(Message::Assistant { text: None, reasoning_content: Some(text), tool_calls: vec![] });
+                    messages.push(Message::Assistant { text: Some(String::new()), reasoning_content: Some(text), tool_calls: vec![] });
                 }
             }
         }
