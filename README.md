@@ -39,10 +39,13 @@ BRIDGE_KEY=x codex
 - `GET /health`.
 
 ## Config
-See `bridge.example.toml`. The Zen key may be set inline (`api_key` under a provider)
-or via `BRIDGE_PROVIDERS_<NAME>_API_KEY` (e.g. `BRIDGE_PROVIDERS_ZEN_API_KEY`).
-Model names map to the upstream by the provider's `model_prefix`, or per-alias via
-`[[routes]]`.
+See [`bridge.example.toml`](bridge.example.toml) for a working template and
+**[`docs/configuration.md`](docs/configuration.md) for the full reference** (every key,
+the `go` package model list, routing rules, and Codex setup).
+
+In short: keys are set inline (`api_key` under a provider) or via
+`BRIDGE_PROVIDERS_<NAME>_API_KEY` (e.g. `BRIDGE_PROVIDERS_GO_API_KEY`); model names map to
+the upstream by the provider's `model_prefix`, or per-alias via `[[routes]]`.
 
 ## Architecture
 See `docs/superpowers/specs/2026-06-05-ai-api-bridge-design.md` and

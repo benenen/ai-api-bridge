@@ -1,18 +1,70 @@
-# Copy to bridge.toml. Provide your OpenCode Zen key via the environment
-# variable BRIDGE_PROVIDERS_ZEN_API_KEY (preferred), or set an `api_key` field
-# under [providers.zen] inline.
+# ai-api-bridge configuration. Copy to `bridge.toml` and edit.
+# Full reference: docs/configuration.md
+#
+# Keys for a provider can be supplied inline (`api_key = "..."`) or — preferred —
+# via the environment variable BRIDGE_PROVIDERS_<NAME>_API_KEY, e.g.
+#   export BRIDGE_PROVIDERS_ZEN_API_KEY=...      # for [providers.zen]
+#   export BRIDGE_PROVIDERS_GO_API_KEY=...       # for [providers.go]
+
 listen = "127.0.0.1:8282"
 default_provider = "zen"
-# auth_token = "set-me-to-require-a-bearer-token-from-clients"
+# Require clients to send `Authorization: Bearer <auth_token>` (Codex sends its
+# env_key value). Leave unset to accept any/no token.
+# auth_token = "set-me-to-a-long-random-string"
 
+# ----------------------------------------------------------------------------
+# OpenCode Zen — the standard gateway (OpenAI/Anthropic/Gemini models).
+# Models use the `opencode/<id>` form, so model_prefix adds it automatically.
+# ----------------------------------------------------------------------------
 [providers.zen]
 wire = "openai-chat"
 base_url = "https://opencode.ai/zen/v1"
 model_prefix = "opencode/"          # gpt-5.5 -> opencode/gpt-5.5
+# api_key = "..."                   # prefer BRIDGE_PROVIDERS_ZEN_API_KEY
 # max_tokens_field = "max_tokens"   # or "max_completion_tokens"
 
-# Optional explicit alias overrides:
+# ----------------------------------------------------------------------------
+# OpenCode "go" package — a separate plan/endpoint with its own API key and a
+# different model line-up. Model ids are passed through as-is (model_prefix="").
+#
+# Models available on the go package (GET /zen/go/v1/models):
+#   deepseek-v4-pro   deepseek-v4-flash
+#   glm-5.1           glm-5
+#   kimi-k2.6         kimi-k2.5
+#   minimax-m3        minimax-m2.7      minimax-m2.5
+#   qwen3.7-max       qwen3.7-plus      qwen3.6-plus      qwen3.5-plus
+#   mimo-v2-pro       mimo-v2-omni      mimo-v2.5-pro     mimo-v2.5
+#   hy3-preview
+#
+# Thinking models (e.g. deepseek-v4-pro) work as-is — the bridge passes their
+# reasoning_content back across turns automatically.
+# ----------------------------------------------------------------------------
+[providers.go]
+wire = "openai-chat"
+base_url = "https://opencode.ai/zen/go/v1"
+model_prefix = ""                   # model names passed through unchanged
+# api_key = "..."                   # prefer BRIDGE_PROVIDERS_GO_API_KEY
+
+# ----------------------------------------------------------------------------
+# Routes map the model name a client sends (alias) to a provider + upstream
+# model. An exact alias match wins; otherwise the default_provider is used and
+# its model_prefix applied. Codex sends whatever `model` is set in ~/.codex/
+# config.toml — point that alias here to choose which upstream model serves it.
+# ----------------------------------------------------------------------------
+
+# Codex's `model = "gpt-5.5"` -> go package, deepseek-v4-pro:
+[[routes]]
+alias = "gpt-5.5"
+provider = "go"
+model = "deepseek-v4-pro"
+
+# Add more aliases to switch models without touching Codex, e.g.:
 # [[routes]]
-# alias = "gpt-5.5"
-# provider = "zen"
-# model = "opencode/gpt-5.5"
+# alias = "fast"
+# provider = "go"
+# model = "deepseek-v4-flash"
+#
+# [[routes]]
+# alias = "glm"
+# provider = "go"
+# model = "glm-5.1"
