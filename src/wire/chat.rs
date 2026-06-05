@@ -85,6 +85,146 @@ fn tool_choice_json(tc: &ToolChoice) -> Value {
     }
 }
 
+use std::collections::HashSet;
+
+/// Stateful translator: upstream Chat Completions stream chunks -> canonical events.
+#[derive(Default)]
+pub struct ChatStreamParser {
+    response_id: String,
+    model: String,
+    created: bool,
+    started_tools: HashSet<u32>,
+}
+
+impl ChatStreamParser {
+    pub fn new(response_id: String) -> Self {
+        Self { response_id, ..Default::default() }
+    }
+
+    pub fn on_chunk(&mut self, chunk: &Value) -> Vec<CanonicalEvent> {
+        let mut events = Vec::new();
+        if !self.created {
+            self.model = chunk.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            events.push(CanonicalEvent::Created {
+                response_id: self.response_id.clone(),
+                model: self.model.clone(),
+            });
+            self.created = true;
+        }
+
+        let choice = chunk
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first());
+
+        if let Some(choice) = choice {
+            if let Some(delta) = choice.get("delta") {
+                if let Some(rc) = delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !rc.is_empty() {
+                        events.push(CanonicalEvent::ReasoningDelta { text: rc.to_string() });
+                    }
+                }
+                if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+                    if !c.is_empty() {
+                        events.push(CanonicalEvent::TextDelta { text: c.to_string() });
+                    }
+                }
+                if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tcs {
+                        let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        if !self.started_tools.contains(&index) {
+                            let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let name = tc.get("function").and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            self.started_tools.insert(index);
+                            events.push(CanonicalEvent::ToolCallStart { index, call_id, name });
+                        }
+                        if let Some(args) = tc.get("function").and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if !args.is_empty() {
+                                events.push(CanonicalEvent::ToolCallArgsDelta { index, delta: args.to_string() });
+                            }
+                        }
+                    }
+                }
+            }
+            if choice.get("finish_reason").and_then(|v| v.as_str()).is_some() {
+                let mut idxs: Vec<u32> = self.started_tools.iter().copied().collect();
+                idxs.sort_unstable();
+                for i in idxs {
+                    events.push(CanonicalEvent::ToolCallDone { index: i });
+                }
+            }
+        }
+
+        if let Some(u) = chunk.get("usage") {
+            if !u.is_null() {
+                events.push(usage_event(u));
+            }
+        }
+        events
+    }
+}
+
+/// Translate a full (non-streaming) Chat Completions response into canonical events.
+pub fn completion_to_events(resp: &Value, response_id: &str) -> Vec<CanonicalEvent> {
+    let mut events = Vec::new();
+    let model = resp.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    events.push(CanonicalEvent::Created { response_id: response_id.to_string(), model });
+
+    if let Some(msg) = resp
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+    {
+        if let Some(rc) = msg.get("reasoning_content").or_else(|| msg.get("reasoning")).and_then(|v| v.as_str()) {
+            if !rc.is_empty() {
+                events.push(CanonicalEvent::ReasoningDelta { text: rc.to_string() });
+            }
+        }
+        if let Some(c) = msg.get("content").and_then(|v| v.as_str()) {
+            if !c.is_empty() {
+                events.push(CanonicalEvent::TextDelta { text: c.to_string() });
+            }
+        }
+        if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+            for (i, tc) in tcs.iter().enumerate() {
+                let index = i as u32;
+                let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                events.push(CanonicalEvent::ToolCallStart { index, call_id, name });
+                if !args.is_empty() {
+                    events.push(CanonicalEvent::ToolCallArgsDelta { index, delta: args });
+                }
+                events.push(CanonicalEvent::ToolCallDone { index });
+            }
+        }
+    }
+
+    if let Some(u) = resp.get("usage") {
+        if !u.is_null() {
+            events.push(usage_event(u));
+        }
+    }
+    events.push(CanonicalEvent::Completed);
+    events
+}
+
+fn usage_event(u: &Value) -> CanonicalEvent {
+    CanonicalEvent::Usage {
+        input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        output_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +291,49 @@ mod tests {
         let body = build_request(&req, "m", &p);
         assert_eq!(body["max_completion_tokens"], 42);
         assert!(body.get("stream").is_none());
+    }
+
+    #[test]
+    fn stream_parser_emits_text_then_usage() {
+        let mut p = ChatStreamParser::new("resp_x".into());
+        let mut evs = p.on_chunk(&json!({"model":"opencode/gpt-5.5",
+            "choices":[{"delta":{"content":"Hel"}}]}));
+        evs.extend(p.on_chunk(&json!({"choices":[{"delta":{"content":"lo"}}]})));
+        evs.extend(p.on_chunk(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})));
+        evs.extend(p.on_chunk(&json!({"choices":[],
+            "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}})));
+        use CanonicalEvent::*;
+        assert_eq!(evs[0], Created { response_id: "resp_x".into(), model: "opencode/gpt-5.5".into() });
+        assert_eq!(evs[1], TextDelta { text: "Hel".into() });
+        assert_eq!(evs[2], TextDelta { text: "lo".into() });
+        assert_eq!(evs.last().unwrap(), &Usage { input_tokens: 3, output_tokens: 2, total_tokens: 5 });
+    }
+
+    #[test]
+    fn stream_parser_handles_tool_call_fragments() {
+        let mut p = ChatStreamParser::new("r".into());
+        let mut evs = p.on_chunk(&json!({"model":"m","choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","function":{"name":"get","arguments":"{\"a\""}}]}}]}));
+        evs.extend(p.on_chunk(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":":1}"}}]}}]})));
+        evs.extend(p.on_chunk(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})));
+        use CanonicalEvent::*;
+        assert!(evs.contains(&ToolCallStart { index: 0, call_id: "call_1".into(), name: "get".into() }));
+        assert!(evs.contains(&ToolCallArgsDelta { index: 0, delta: "{\"a\"".into() }));
+        assert!(evs.contains(&ToolCallArgsDelta { index: 0, delta: ":1}".into() }));
+        assert!(evs.contains(&ToolCallDone { index: 0 }));
+    }
+
+    #[test]
+    fn completion_to_events_full_message() {
+        let resp = json!({"model":"m","choices":[{"message":{"content":"hi",
+            "tool_calls":[{"id":"c","function":{"name":"f","arguments":"{}"}}]}}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+        let evs = completion_to_events(&resp, "r1");
+        use CanonicalEvent::*;
+        assert_eq!(evs.first().unwrap(), &Created { response_id: "r1".into(), model: "m".into() });
+        assert!(evs.contains(&TextDelta { text: "hi".into() }));
+        assert!(evs.contains(&ToolCallStart { index: 0, call_id: "c".into(), name: "f".into() }));
+        assert_eq!(evs.last().unwrap(), &Completed);
     }
 }
