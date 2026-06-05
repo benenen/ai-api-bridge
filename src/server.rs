@@ -99,17 +99,21 @@ fn stream_sse(
         let mut completed = false;
 
         futures_util::pin_mut!(byte_stream);
-        while let Some(chunk) = byte_stream.next().await {
+        'outer: while let Some(chunk) = byte_stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    for item in decoder.push(&text) {
+                    for item in decoder.push(&bytes) {
                         match item {
                             SseItem::Data(d) => {
                                 let Ok(json) = serde_json::from_str::<Value>(&d) else { continue };
                                 for cev in parser.on_chunk(&json) {
+                                    let is_error = matches!(cev, CanonicalEvent::Error { .. });
                                     for fr in emitter.on_event(&cev) {
                                         yield Ok(Event::default().event(fr.event).data(fr.data.to_string()));
+                                    }
+                                    if is_error {
+                                        completed = true;
+                                        break 'outer;
                                     }
                                 }
                             }
@@ -118,6 +122,7 @@ fn stream_sse(
                                     yield Ok(Event::default().event(fr.event).data(fr.data.to_string()));
                                 }
                                 completed = true;
+                                break 'outer;
                             }
                         }
                     }

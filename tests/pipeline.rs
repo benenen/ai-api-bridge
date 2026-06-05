@@ -25,6 +25,17 @@ async fn mock_chat() -> axum::response::Response {
         .unwrap()
 }
 
+async fn mock_chat_error() -> axum::response::Response {
+    let body = concat!(
+        "data: {\"error\":{\"message\":\"rate limited\",\"code\":429}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
 async fn spawn(app: Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -63,6 +74,26 @@ model_prefix = "opencode/"
     assert!(text.contains("world"));
     assert!(text.contains("event: response.completed"));
     assert!(text.contains("\"total_tokens\":7"));
+}
+
+#[tokio::test]
+async fn inband_upstream_error_becomes_response_failed() {
+    let upstream_url = spawn(Router::new().route("/chat/completions", post(mock_chat_error))).await;
+    let cfg = Config::from_toml(&format!(
+        "default_provider=\"zen\"\n[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"{upstream_url}\"\nmodel_prefix=\"opencode/\""
+    ))
+    .unwrap();
+    let bridge_url = spawn(build_app(Arc::new(AppState { config: cfg, upstream: Upstream::new() }))).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{bridge_url}/v1/responses"))
+        .json(&json!({"model": "gpt-5.5", "input": "hi", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("event: response.failed"), "expected response.failed, got: {text}");
+    assert!(text.contains("rate limited"));
+    assert!(!text.contains("event: response.completed"));
 }
 
 #[tokio::test]

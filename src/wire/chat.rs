@@ -102,6 +102,21 @@ impl ChatStreamParser {
     }
 
     pub fn on_chunk(&mut self, chunk: &Value) -> Vec<CanonicalEvent> {
+        if let Some(err) = chunk.get("error") {
+            if !err.is_null() {
+                let message = err
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("upstream error")
+                    .to_string();
+                let status = err
+                    .get("code")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u16)
+                    .unwrap_or(502);
+                return vec![CanonicalEvent::Error { message, status }];
+            }
+        }
         let mut events = Vec::new();
         if !self.created {
             self.model = chunk.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -322,6 +337,14 @@ mod tests {
         assert!(evs.contains(&ToolCallArgsDelta { index: 0, delta: "{\"a\"".into() }));
         assert!(evs.contains(&ToolCallArgsDelta { index: 0, delta: ":1}".into() }));
         assert!(evs.contains(&ToolCallDone { index: 0 }));
+    }
+
+    #[test]
+    fn stream_parser_surfaces_inband_error() {
+        let mut p = ChatStreamParser::new("r".into());
+        let evs = p.on_chunk(&json!({"error":{"message":"rate limited","code":429}}));
+        use CanonicalEvent::*;
+        assert_eq!(evs, vec![Error { message: "rate limited".into(), status: 429 }]);
     }
 
     #[test]
