@@ -108,3 +108,33 @@ async fn unknown_model_returns_400() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 }
+
+#[tokio::test]
+async fn lists_models() {
+    let cfg = Config::from_toml(
+        "default_provider=\"zen\"\n[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"u\"\n[[routes]]\nalias=\"fast\"\nprovider=\"zen\"\nmodel=\"opencode/x\"",
+    )
+    .unwrap();
+    let url = spawn(build_app(Arc::new(AppState { config: cfg, upstream: Upstream::new() }))).await;
+    let body: serde_json::Value = reqwest::get(format!("{url}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["object"], "list");
+    assert!(body["data"].as_array().unwrap().iter().any(|m| m["id"] == "fast"));
+}
+
+#[tokio::test]
+async fn messages_endpoint_returns_501() {
+    let cfg = Config::from_toml("[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"u\"").unwrap();
+    let url = spawn(build_app(Arc::new(AppState { config: cfg, upstream: Upstream::new() }))).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{url}/v1/messages"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+}

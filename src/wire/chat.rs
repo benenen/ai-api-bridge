@@ -4,6 +4,7 @@ use serde_json::{json, Map, Value};
 
 use crate::canonical::*;
 use crate::config::Provider;
+use crate::error::BridgeError;
 
 pub fn build_request(req: &CanonicalRequest, upstream_model: &str, provider: &Provider) -> Value {
     let mut messages: Vec<Value> = Vec::new();
@@ -74,6 +75,50 @@ pub fn build_request(req: &CanonicalRequest, upstream_model: &str, provider: &Pr
     }
 
     Value::Object(body)
+}
+
+/// Parse a Chat Completions *request* body into the canonical request
+/// (used when the bridge serves the Chat Completions inbound endpoint).
+pub fn parse_request(body: &Value) -> Result<CanonicalRequest, BridgeError> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| BridgeError::BadRequest("body must be a JSON object".into()))?;
+    let model = obj
+        .get("model")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| BridgeError::BadRequest("missing `model`".into()))?
+        .to_string();
+    let mut system = None;
+    let mut messages = Vec::new();
+    if let Some(arr) = obj.get("messages").and_then(|v| v.as_array()) {
+        for m in arr {
+            let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            match role {
+                "system" | "developer" => system = Some(content),
+                "tool" => messages.push(Message::Tool {
+                    call_id: m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    output: content,
+                }),
+                "assistant" => messages.push(Message::Assistant { text: Some(content), tool_calls: vec![] }),
+                _ => messages.push(Message::User(content)),
+            }
+        }
+    }
+    let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    Ok(CanonicalRequest {
+        model,
+        system,
+        messages,
+        tools: vec![],
+        tool_choice: ToolChoice::Auto,
+        temperature: obj.get("temperature").and_then(|v| v.as_f64()).map(|f| f as f32),
+        top_p: None,
+        max_output_tokens: obj.get("max_tokens").and_then(|v| v.as_u64()).map(|n| n as u32),
+        reasoning_effort: None,
+        parallel_tool_calls: None,
+        stream,
+    })
 }
 
 fn tool_choice_json(tc: &ToolChoice) -> Value {
@@ -345,6 +390,20 @@ mod tests {
         let evs = p.on_chunk(&json!({"error":{"message":"rate limited","code":429}}));
         use CanonicalEvent::*;
         assert_eq!(evs, vec![Error { message: "rate limited".into(), status: 429 }]);
+    }
+
+    #[test]
+    fn parses_chat_inbound_request() {
+        let body = json!({"model": "gpt-5.5", "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "hi"}
+        ], "stream": true, "max_tokens": 50});
+        let req = parse_request(&body).unwrap();
+        assert_eq!(req.model, "gpt-5.5");
+        assert_eq!(req.system.as_deref(), Some("s"));
+        assert_eq!(req.messages, vec![Message::User("hi".into())]);
+        assert!(req.stream);
+        assert_eq!(req.max_output_tokens, Some(50));
     }
 
     #[test]

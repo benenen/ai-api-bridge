@@ -11,7 +11,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{Stream, StreamExt};
-use serde_json::Value;
+use axum::body::Body;
+use serde_json::{json, Value};
 
 use crate::canonical::CanonicalEvent;
 use crate::config::Config;
@@ -30,6 +31,9 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/responses", post(responses_handler))
+        .route("/v1/chat/completions", post(chat_handler))
+        .route("/v1/models", get(list_models))
+        .route("/v1/messages", post(messages_handler))
         .with_state(state)
 }
 
@@ -145,4 +149,50 @@ fn stream_sse(
         }
     };
     Sse::new(s)
+}
+
+/// Chat Completions inbound: parse → route → call upstream → pass the response
+/// straight through (inbound and outbound are both Chat Completions, so no
+/// response translation is needed; streaming bytes are forwarded verbatim).
+async fn chat_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, BridgeError> {
+    check_auth(&state, &headers)?;
+    let req = chat::parse_request(&body)?;
+    let resolved = router::resolve(&state.config, &req.model)?;
+    let chat_body = chat::build_request(&req, &resolved.upstream_model, resolved.provider);
+
+    if req.stream {
+        let byte_stream = state
+            .upstream
+            .post_stream(resolved.provider, "/chat/completions", &chat_body)
+            .await?;
+        let resp = Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(byte_stream))
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        Ok(resp)
+    } else {
+        let resp = state
+            .upstream
+            .post_json(resolved.provider, "/chat/completions", &chat_body)
+            .await?;
+        Ok(Json(resp).into_response())
+    }
+}
+
+async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let data: Vec<Value> = state
+        .config
+        .routes
+        .iter()
+        .map(|r| json!({"id": r.alias, "object": "model", "owned_by": r.provider}))
+        .collect();
+    Json(json!({"object": "list", "data": data}))
+}
+
+async fn messages_handler() -> Result<Response, BridgeError> {
+    Err(crate::wire::anthropic::not_implemented())
 }
