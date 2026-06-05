@@ -35,7 +35,7 @@ impl Upstream {
         provider: &Provider,
         path: &str,
         body: &Value,
-    ) -> Result<impl Stream<Item = reqwest::Result<Bytes>>, BridgeError> {
+    ) -> Result<impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static, BridgeError> {
         let resp = self
             .request(provider, path, body)
             .send()

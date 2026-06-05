@@ -1,19 +1,11 @@
-mod canonical;
-mod config;
-mod error;
-mod router;
-mod server;
-mod sse;
-mod upstream;
-mod wire;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 
-use crate::config::Config;
-use crate::server::{build_app, AppState};
+use ai_api_bridge::config::Config;
+use ai_api_bridge::server::{build_app, AppState};
+use ai_api_bridge::upstream::Upstream;
 
 #[derive(Parser, Debug)]
 #[command(name = "ai-api-bridge")]
@@ -42,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let addr = config.listen.clone();
 
-    let state = Arc::new(AppState { config });
+    let state = Arc::new(AppState { config, upstream: Upstream::new() });
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
