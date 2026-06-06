@@ -56,17 +56,26 @@ wire-format directly:
   forwards upstream bytes verbatim via `Body::from_stream` (no re-encoding).
 - `router.rs` — explicit `[[routes]]` win; otherwise the default provider's `model_prefix`
   is applied (`gpt-5.5` -> `opencode/gpt-5.5`) unless the alias already contains `/`.
+  `resolve` also takes the live status map and **fails over** along a route's `fallback`
+  chain, skipping providers that are `available=false` or below `quota_min`.
 - `upstream.rs` — reqwest client; `post_stream` (SSE) and `post_json` (non-stream).
-- `store.rs` — SQLite (sqlx, runtime queries) for providers + routes. `bridge.toml` seeds
-  an empty DB once (`seed_from_config`), then the DB is authoritative; `main` runs
-  `open` → seed-if-`is_empty` → `load_into_config` → `apply_env_overrides`, all at startup
-  (no per-request DB hit; pool is dropped before serving). `migrations/` holds the schema;
-  `--reseed` clears + re-imports. The router/server are unchanged — they still read the
-  in-memory `Config`.
+- `store.rs` — SQLite (sqlx, runtime queries) for providers + routes + `provider_status`.
+  `bridge.toml` seeds an empty DB once (`seed_from_config`), then the DB is authoritative;
+  `main` runs `open` → seed-if-`is_empty` → `load_into_config` → `apply_env_overrides` at
+  startup (no per-request DB hit). The pool **stays alive** for the watcher's writes.
+  `migrations/` holds the schema; `--reseed` clears + re-imports.
+- `probe.rs` — `run_probe(name, provider)`: runs the provider's Lua `probe_script` in
+  `spawn_blocking` (injects `ctx` + `http{}` via `reqwest::blocking` + `json_decode/encode`;
+  returns `{ok,remaining,used,limit,note}`), or a connectivity ping if there's no script.
+- `watcher.rs` — one background task per probe-enabled provider on its interval; writes each
+  result to the DB + the shared `StatusMap` (`Arc<RwLock<HashMap<String, ProviderStatus>>>`,
+  also held in `AppState`), logging availability changes. The router and `/v1/providers`
+  read this map.
 
 ## Endpoints
 `POST /v1/responses` (Codex) · `POST /v1/messages` (Anthropic Messages, for Claude Code) ·
-`POST /v1/chat/completions` (passthrough) · `GET /v1/models` · `GET /health`.
+`POST /v1/chat/completions` (passthrough) · `GET /v1/models` ·
+`GET /v1/providers` (watcher status) · `GET /health`.
 
 ## Conventions / gotchas
 - Wire-format dispatch is plain functions + a sync `CanonicalEmitter` trait (used as a

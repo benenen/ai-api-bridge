@@ -54,7 +54,14 @@ claude
 - `POST /v1/messages` — Anthropic Messages API (for Claude Code).
 - `POST /v1/chat/completions` — OpenAI Chat Completions (passthrough).
 - `GET /v1/models` — configured aliases.
+- `GET /v1/providers` — per-provider availability + quota (the watcher).
 - `GET /health`.
+
+## Monitoring & failover
+A background watcher probes each provider's availability and quota (via a per-provider Lua
+script — see [`probes/`](probes) and `docs/configuration.md`) and exposes it at
+`GET /v1/providers`. A route can declare a `fallback` chain; the router automatically skips
+providers that are down or below their `quota_min` and uses the next one.
 
 ## Config
 See [`bridge.example.toml`](bridge.example.toml) for a working template and

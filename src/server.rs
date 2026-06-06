@@ -20,11 +20,13 @@ use crate::error::BridgeError;
 use crate::router;
 use crate::sse::{SseDecoder, SseItem};
 use crate::upstream::Upstream;
+use crate::watcher::StatusMap;
 use crate::wire::{CanonicalEmitter, anthropic, chat, responses};
 
 pub struct AppState {
     pub config: Config,
     pub upstream: Upstream,
+    pub status: StatusMap,
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
@@ -34,7 +36,41 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(chat_handler))
         .route("/v1/models", get(list_models))
         .route("/v1/messages", post(messages_handler))
+        .route("/v1/providers", get(providers_status))
         .with_state(state)
+}
+
+/// Watcher view of each provider: availability + quota + last-check info.
+async fn providers_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let status = state.status.read().ok();
+    let mut providers: Vec<Value> = state
+        .config
+        .providers
+        .iter()
+        .map(|(name, p)| {
+            let s = status
+                .as_ref()
+                .and_then(|m| m.get(name))
+                .cloned()
+                .unwrap_or_default();
+            json!({
+                "name": name,
+                "base_url": p.base_url,
+                "probe_enabled": p.probe_enabled(),
+                "available": s.available,
+                "quota_remaining": s.quota_remaining,
+                "quota_used": s.quota_used,
+                "quota_limit": s.quota_limit,
+                "quota_min": p.quota_min,
+                "last_checked": s.last_checked,
+                "last_ok": s.last_ok,
+                "error": s.error,
+                "note": s.note,
+            })
+        })
+        .collect();
+    providers.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Json(json!({ "providers": providers }))
 }
 
 async fn health() -> &'static str {
@@ -68,7 +104,10 @@ async fn responses_handler(
     check_auth(&state, &headers)?;
 
     let req = responses::parse_request(&body)?;
-    let resolved = router::resolve(&state.config, &req.model)?;
+    let resolved = {
+        let status = state.status.read().unwrap_or_else(|e| e.into_inner());
+        router::resolve(&state.config, &status, &req.model)?
+    };
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
 
     tracing::info!(model = %req.model, provider = %resolved.provider_name,
@@ -171,7 +210,10 @@ async fn chat_handler(
 ) -> Result<Response, BridgeError> {
     check_auth(&state, &headers)?;
     let req = chat::parse_request(&body)?;
-    let resolved = router::resolve(&state.config, &req.model)?;
+    let resolved = {
+        let status = state.status.read().unwrap_or_else(|e| e.into_inner());
+        router::resolve(&state.config, &status, &req.model)?
+    };
     let chat_body = chat::build_request(&req, &resolved.upstream_model, resolved.provider);
 
     if req.stream {
@@ -214,7 +256,10 @@ async fn messages_handler(
     check_auth(&state, &headers)?;
 
     let req = anthropic::parse_request(&body)?;
-    let resolved = router::resolve(&state.config, &req.model)?;
+    let resolved = {
+        let status = state.status.read().unwrap_or_else(|e| e.into_inner());
+        router::resolve(&state.config, &status, &req.model)?
+    };
     let response_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
     tracing::info!(model = %req.model, provider = %resolved.provider_name,

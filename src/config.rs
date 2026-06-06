@@ -1,6 +1,6 @@
 //! Bridge configuration: providers (outbound targets) + model routes.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,10 +39,34 @@ pub struct Provider {
     pub max_tokens_field: String,
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
+    /// Path to a Lua quota probe (see `probes/`). Absent = availability-ping only.
+    #[serde(default)]
+    pub probe_script: Option<String>,
+    /// Explicit on/off for the watcher (defaults to on when `probe_script` is set).
+    #[serde(default)]
+    pub probe_enabled: Option<bool>,
+    /// Seconds between probes (default 300).
+    #[serde(default)]
+    pub probe_interval_secs: Option<u64>,
+    /// Below this `quota_remaining` the provider counts as exhausted (for failover).
+    #[serde(default)]
+    pub quota_min: Option<f64>,
 }
 
 fn default_max_tokens_field() -> String {
     "max_tokens".to_string()
+}
+
+impl Provider {
+    /// Whether the watcher should run for this provider.
+    pub fn probe_enabled(&self) -> bool {
+        self.probe_enabled.unwrap_or(self.probe_script.is_some())
+    }
+
+    /// Probe interval (default 300s).
+    pub fn probe_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.probe_interval_secs.unwrap_or(300).max(1))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -56,6 +80,17 @@ pub enum WireName {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Route {
     pub alias: String,
+    pub provider: String,
+    pub model: String,
+    /// Ordered fallback targets tried (in order) when the primary provider is
+    /// unavailable or quota-exhausted.
+    #[serde(default)]
+    pub fallback: Vec<RouteTarget>,
+}
+
+/// A (provider, model) pair — the primary of a route or one of its fallbacks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteTarget {
     pub provider: String,
     pub model: String,
 }

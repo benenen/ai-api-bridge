@@ -401,6 +401,10 @@ mod tests {
             model_prefix: Some("opencode/".into()),
             max_tokens_field: "max_tokens".into(),
             extra_headers: HashMap::new(),
+            probe_script: None,
+            probe_enabled: None,
+            probe_interval_secs: None,
+            quota_min: None,
         }
     }
 

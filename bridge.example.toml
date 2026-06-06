@@ -53,6 +53,10 @@ wire = "openai-chat"
 base_url = "https://opencode.ai/zen/go/v1"
 model_prefix = ""                   # model names passed through unchanged
 # api_key = "..."                   # prefer BRIDGE_PROVIDERS_GO_API_KEY
+# --- watcher (optional): a Lua probe checks quota/availability; status at GET /v1/providers
+probe_script = "probes/opencode-zen.lua"   # availability via /models (Zen has no quota API)
+probe_interval_secs = 300
+# quota_min = 1.0                   # for vendors with a real quota: failover when below this
 
 # ----------------------------------------------------------------------------
 # Routes map the model name a client sends (alias) to a provider + upstream
@@ -69,6 +73,8 @@ model_prefix = ""                   # model names passed through unchanged
 alias = "gpt-5.5"
 provider = "go"
 model = "deepseek-v4-pro"
+# Optional failover: if `go` is unavailable or below its quota_min, try these in order.
+# fallback = [{ provider = "zen", model = "gpt-5.5" }]
 
 # Add more aliases to switch models without touching Codex, e.g.:
 # [[routes]]

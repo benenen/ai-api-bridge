@@ -79,6 +79,10 @@ routes and by the key env var.
 | `model_prefix` | string | `""` | Prepended to the model name when a route doesn't specify one and the alias has no `/`. e.g. `opencode/` turns `gpt-5.5` into `opencode/gpt-5.5`. |
 | `max_tokens_field` | string | `max_tokens` | Field used to send the token cap (`max_tokens` or `max_completion_tokens`). |
 | `extra_headers` | table | `{}` | Extra HTTP headers sent on every upstream request. |
+| `probe_script` | string | — | Path to a Lua quota probe (see [Provider watcher](#provider-watcher-quota--availability--failover)). Absent = availability-ping only. |
+| `probe_enabled` | bool | on if `probe_script` set | Master switch for monitoring this provider. |
+| `probe_interval_secs` | int | `300` | Seconds between probes. |
+| `quota_min` | float | — | Below this `quota_remaining` the provider counts as exhausted (for failover). |
 
 ### Provider keys
 
@@ -139,13 +143,16 @@ provider + upstream model.
 | `alias` | The `model` value the client sends. |
 | `provider` | Which `[providers.<name>]` to use. |
 | `model` | The upstream model id to send. |
+| `fallback` | Ordered `{ provider, model }` list tried (in order) when the primary is unavailable / quota-exhausted (see [Provider watcher](#provider-watcher-quota--availability--failover)). |
 
 ```toml
-# Codex sends model = "gpt-5.5"; serve it from the go package's deepseek-v4-pro.
+# Codex sends model = "gpt-5.5"; serve it from the go package's deepseek-v4-pro,
+# falling back to zen if go is down or out of quota.
 [[routes]]
 alias = "gpt-5.5"
 provider = "go"
 model = "deepseek-v4-pro"
+fallback = [{ provider = "zen", model = "gpt-5.5" }]
 
 [[routes]]
 alias = "fast"
@@ -163,6 +170,57 @@ model = "deepseek-v4-flash"
 
 This means you can switch which upstream model backs Codex by editing a route's `model`,
 without touching Codex itself.
+
+## Provider watcher (quota + availability + failover)
+
+A background watcher tracks each provider's **availability** and (where the vendor exposes
+it) **remaining quota**, persists it to the DB, and serves it at `GET /v1/providers`. The
+router uses it to **fail over** away from a down or exhausted provider.
+
+### Probes are Lua scripts
+
+Quota APIs differ per vendor, so the bridge never hardcodes them — each provider points at a
+Lua script (`probe_script`) that drives the HTTP call and returns the result. Scripts get:
+
+- `ctx` — `{ name, base_url, api_key, extra_headers, wire }`.
+- `http{ url, method = "GET", headers = {}, body = nil }` → `{ status, body }`.
+- `json_decode(str)` → table, `json_encode(table)` → string.
+
+and return `{ ok = bool, remaining?, used?, limit?, note? }`. A script error or a missing
+return is recorded as unavailable. Example probes live in [`probes/`](../probes):
+`opencode-zen.lua` (availability via `/models`; Zen has no quota endpoint) and
+`generic-credits.lua` (a template for vendors that expose a credits endpoint).
+
+```lua
+-- probes/opencode-zen.lua
+local resp = http {
+    url = ctx.base_url .. "/models",
+    headers = { authorization = "Bearer " .. (ctx.api_key or "") },
+}
+return { ok = resp.status == 200, note = "GET /models -> " .. resp.status }
+```
+
+Providers with **no** `probe_script` (but `probe_enabled = true`) get a lightweight
+connectivity ping instead: any HTTP response = available, a connection error = unavailable.
+
+### Scheduling & switch
+
+Each enabled provider is probed at startup and every `probe_interval_secs` (default 300).
+`probe_enabled` is the master switch (defaults on when a `probe_script` is set). Probing is
+periodic and out-of-band — it never adds latency to a request.
+
+### Failover
+
+`router::resolve` builds a candidate chain — the route's primary then its `fallback` list —
+and picks the **first usable** one. A provider is skipped when its status is `available =
+false`, or when `quota_remaining` is known and below the provider's `quota_min`. If every
+candidate is degraded, the primary is attempted anyway (and a warning is logged). Providers
+that aren't monitored (no status yet) are assumed usable.
+
+### Status endpoint
+
+`GET /v1/providers` returns each provider's `available`, `quota_remaining/used/limit`,
+`quota_min`, `last_checked` (epoch secs), `last_ok`, `error`, and `note`.
 
 ## Pointing Codex at the bridge
 
@@ -207,6 +265,7 @@ across turns.
 | `POST /v1/messages` | Anthropic Messages API — for Claude Code (`ANTHROPIC_BASE_URL`). |
 | `POST /v1/chat/completions` | OpenAI Chat Completions — verbatim passthrough. |
 | `GET /v1/models` | Lists configured route aliases. |
+| `GET /v1/providers` | Watcher status per provider (availability + quota). |
 | `GET /health` | Liveness check (returns `ok`). |
 
 ## Full example

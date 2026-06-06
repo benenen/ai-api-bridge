@@ -83,6 +83,7 @@ model_prefix = "opencode/"
     let bridge_url = spawn(build_app(Arc::new(AppState {
         config: cfg,
         upstream: Upstream::new(),
+        status: Default::default(),
     })))
     .await;
 
@@ -113,6 +114,7 @@ async fn inband_upstream_error_becomes_response_failed() {
     let bridge_url = spawn(build_app(Arc::new(AppState {
         config: cfg,
         upstream: Upstream::new(),
+        status: Default::default(),
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -138,6 +140,7 @@ async fn unknown_model_returns_400() {
     let bridge_url = spawn(build_app(Arc::new(AppState {
         config: cfg,
         upstream: Upstream::new(),
+        status: Default::default(),
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -158,6 +161,7 @@ async fn lists_models() {
     let url = spawn(build_app(Arc::new(AppState {
         config: cfg,
         upstream: Upstream::new(),
+        status: Default::default(),
     })))
     .await;
     let body: serde_json::Value = reqwest::get(format!("{url}/v1/models"))
@@ -190,6 +194,7 @@ async fn messages_streaming_end_to_end() {
     let bridge_url = spawn(build_app(Arc::new(AppState {
         config: cfg,
         upstream: Upstream::new(),
+        status: Default::default(),
     })))
     .await;
 
@@ -223,6 +228,7 @@ async fn messages_non_streaming_end_to_end() {
     let bridge_url = spawn(build_app(Arc::new(AppState {
         config: cfg,
         upstream: Upstream::new(),
+        status: Default::default(),
     })))
     .await;
 
@@ -253,6 +259,7 @@ async fn messages_tool_use_streaming() {
     let bridge_url = spawn(build_app(Arc::new(AppState {
         config: cfg,
         upstream: Upstream::new(),
+        status: Default::default(),
     })))
     .await;
 
@@ -281,6 +288,7 @@ async fn messages_missing_model_returns_400() {
     let url = spawn(build_app(Arc::new(AppState {
         config: cfg,
         upstream: Upstream::new(),
+        status: Default::default(),
     })))
     .await;
     let resp = reqwest::Client::new()

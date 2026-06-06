@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use clap::Parser;
 
+use std::sync::RwLock;
+
 use ai_api_bridge::config::Config;
 use ai_api_bridge::server::{AppState, build_app};
-use ai_api_bridge::store;
 use ai_api_bridge::upstream::Upstream;
+use ai_api_bridge::{store, watcher};
 
 #[derive(Parser, Debug)]
 #[command(name = "ai-api-bridge")]
@@ -61,7 +63,6 @@ async fn main() -> anyhow::Result<()> {
     }
     store::load_into_config(&pool, &mut config).await?;
     config.apply_env_overrides();
-    pool.close().await;
     tracing::info!(
         db = %db_path,
         providers = config.providers.len(),
@@ -69,9 +70,17 @@ async fn main() -> anyhow::Result<()> {
         "loaded providers/routes from DB"
     );
 
+    // Provider watcher: seed the in-memory status map from the DB, then spawn a
+    // background probe per enabled provider (keeps the pool alive for writes).
+    let status: watcher::StatusMap = Arc::new(RwLock::new(
+        store::load_statuses(&pool).await.unwrap_or_default(),
+    ));
+    watcher::spawn(pool.clone(), &config.providers, status.clone());
+
     let state = Arc::new(AppState {
         config,
         upstream: Upstream::new(),
+        status,
     });
     let app = build_app(state);
 
