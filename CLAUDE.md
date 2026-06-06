@@ -77,9 +77,18 @@ wire-format directly:
   read this map.
 
 ## Endpoints
-`POST /v1/responses` (Codex) · `POST /v1/messages` (Anthropic Messages, for Claude Code) ·
-`POST /v1/chat/completions` (passthrough) · `GET /v1/models` ·
-`GET /v1/providers` (watcher status) · `GET /health`.
+- **AI clients / proxy**: `POST /v1/responses` (Codex) · `POST /v1/messages` (Anthropic
+  Messages, for Claude Code) · `POST /v1/chat/completions` (passthrough) · `GET /v1/models` ·
+  `GET /v1/providers` (watcher status) · `GET /health`.
+- **Admin** (`admin.rs`, reuse `check_auth` / `auth_token`): `GET /` and `/admin` serve the
+  embedded management page (`web/admin.html`, `include_str!`). CRUD over the SQLite-backed
+  config: `GET/POST /admin/api/providers`, `PUT/DELETE /admin/api/providers/:name`,
+  `GET/POST /admin/api/routes`, `PUT/DELETE /admin/api/routes/:alias`. List masks `api_key`
+  (`api_key_set`); update preserves the stored key when the field is blank. Every write runs
+  `server::reload_from_db` — rebuilds the `Config` snapshot, reconciles the watcher
+  (`watcher::reconcile` aborts + respawns probe tasks), and prunes the `StatusMap`. Hence
+  `AppState.config` is `RwLock<Arc<Config>>`: handlers take an `Arc` snapshot at entry so
+  `Resolved<'a>` never borrows across an `.await`.
 
 ## Conventions / gotchas
 - Wire-format dispatch is plain functions + a sync `CanonicalEmitter` trait (used as a
