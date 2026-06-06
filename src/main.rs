@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, RwLock};
 
 use ai_api_bridge::config::Config;
@@ -93,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
     if let Ok(events) = store::load_usage_events(&pool, now - 31 * 24 * 3600).await {
         usage.load(events);
     }
+    let cost_tracking = config.cost_tracking;
+    tracing::info!(cost_tracking, "cost/usage tracking");
 
     let state = Arc::new(AppState {
         config: RwLock::new(Arc::new(config)),
@@ -101,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
         pool: Some(pool),
         watchers,
         usage,
+        usage_on: AtomicBool::new(cost_tracking),
     });
     let app = build_app(state);
 

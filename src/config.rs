@@ -13,6 +13,13 @@ pub struct Config {
     pub database: String,
     pub default_provider: Option<String>,
     pub auth_token: Option<String>,
+    /// Master switch for cost/usage tracking. When `false` (the default) the bridge
+    /// records no cost, writes no `usage_events`, hides `cost_windows` from
+    /// `/v1/providers`, and does no usage-based failover — the record path
+    /// short-circuits at zero overhead. **Reactive 429 failover is unaffected.**
+    /// Sets the startup default; toggle at runtime via `POST /admin/api/usage`.
+    #[serde(default)]
+    pub cost_tracking: bool,
     #[serde(default)]
     pub providers: HashMap<String, Provider>,
     #[serde(default)]

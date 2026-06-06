@@ -19,6 +19,12 @@ default_provider = "zen"
 # Require clients to send the token: `Authorization: Bearer <auth_token>` (Codex's env_key)
 # or `x-api-key: <auth_token>` (Claude Code's ANTHROPIC_API_KEY). Unset = accept any/no token.
 # auth_token = "set-me-to-a-long-random-string"
+# Cost/usage tracking master switch (default false = OFF). Off = no cost recorded,
+# no usage_events written, cost_windows hidden from /v1/providers, and no usage-based
+# failover — all at zero overhead. **Reactive 429 failover is unaffected.** This sets
+# the startup default; toggle at runtime on the admin page or via
+# `POST /admin/api/usage {"enabled": true}` (runtime-only — reverts to this on restart).
+cost_tracking = false
 
 # ----------------------------------------------------------------------------
 # OpenCode Zen — the standard gateway (OpenAI/Anthropic/Gemini models).

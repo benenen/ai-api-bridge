@@ -1,6 +1,7 @@
 //! axum app + handlers + the streaming translation pipeline.
 
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_stream::stream;
@@ -39,6 +40,9 @@ pub struct AppState {
     pub watchers: WatcherHandles,
     /// Rolling per-provider cost accumulator (windows + failover input).
     pub usage: Arc<UsageMeter>,
+    /// Master switch for all cost/usage tracking (seeded from `cost_tracking`).
+    /// When off, every usage path short-circuits; 429 failover is unaffected.
+    pub usage_on: AtomicBool,
 }
 
 /// Records the served provider's cost when a (streaming) response finishes. Holds
@@ -58,6 +62,21 @@ fn price_for(cfg: &Config, provider: &str, model: &str) -> Option<ModelPrice> {
         .copied()
 }
 
+/// Build a stream cost recorder — `None` when tracking is off, so `run_stream`
+/// skips all cost/token capture (zero overhead).
+fn cost_recorder(
+    state: &AppState,
+    cfg: &Config,
+    provider: String,
+    model: &str,
+) -> Option<CostRecorder> {
+    state.usage_enabled().then(|| CostRecorder {
+        meter: state.usage.clone(),
+        price: price_for(cfg, &provider, model),
+        provider,
+    })
+}
+
 /// Current unix time in seconds (for cost-event timestamps).
 pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -73,6 +92,16 @@ impl AppState {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Whether cost/usage tracking is currently on.
+    pub fn usage_enabled(&self) -> bool {
+        self.usage_on.load(Ordering::Relaxed)
+    }
+
+    /// Flip cost/usage tracking on/off at runtime (admin toggle).
+    pub fn set_usage_enabled(&self, on: bool) {
+        self.usage_on.store(on, Ordering::Relaxed);
     }
 }
 
@@ -134,6 +163,11 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             "/admin/api/routes/:alias",
             put(admin::update_route).delete(admin::delete_route),
         )
+        // Cost/usage tracking master switch.
+        .route(
+            "/admin/api/usage",
+            get(admin::get_usage).post(admin::set_usage),
+        )
         .with_state(state)
 }
 
@@ -142,6 +176,7 @@ async fn providers_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let cfg = state.config();
     let status = state.status.read().ok();
     let now = now_secs();
+    let enabled = state.usage_enabled();
     let mut providers: Vec<Value> = cfg
         .providers
         .iter()
@@ -151,6 +186,12 @@ async fn providers_status(State(state): State<Arc<AppState>>) -> Json<Value> {
                 .and_then(|m| m.get(name))
                 .cloned()
                 .unwrap_or_default();
+            // Hidden entirely when tracking is off (no window computation either).
+            let cost_windows = if enabled {
+                json!(state.usage.windows(name, &p.cost_windows, now))
+            } else {
+                json!([])
+            };
             json!({
                 "name": name,
                 "base_url": p.base_url,
@@ -164,12 +205,12 @@ async fn providers_status(State(state): State<Arc<AppState>>) -> Json<Value> {
                 "last_ok": s.last_ok,
                 "error": s.error,
                 "note": s.note,
-                "cost_windows": state.usage.windows(name, &p.cost_windows, now),
+                "cost_windows": cost_windows,
             })
         })
         .collect();
     providers.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    Json(json!({ "providers": providers }))
+    Json(json!({ "providers": providers, "cost_tracking": enabled }))
 }
 
 async fn health() -> &'static str {
@@ -207,7 +248,12 @@ async fn responses_handler(
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let candidates = {
         let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        let exhausted = state.usage.exhausted_set(&cfg.providers, now_secs());
+        // Usage-based demotion only when tracking is on; 429 failover is separate.
+        let exhausted = if state.usage_enabled() {
+            state.usage.exhausted_set(&cfg.providers, now_secs())
+        } else {
+            std::collections::HashSet::new()
+        };
         router::resolve_candidates(&cfg, &status, &exhausted, &req.model)?
     };
     tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, "responses request");
@@ -215,16 +261,12 @@ async fn responses_handler(
     if req.stream {
         let (provider, model, byte_stream) =
             open_upstream_stream(&state, &req, &candidates).await?;
-        let price = price_for(&cfg, &provider, &model);
+        let recorder = cost_recorder(&state, &cfg, provider, &model);
         Ok(run_stream(
             byte_stream,
             response_id,
             responses::ResponsesEmitter::new(),
-            Some(CostRecorder {
-                meter: state.usage.clone(),
-                provider,
-                price,
-            }),
+            recorder,
         )
         .into_response())
     } else {
@@ -247,8 +289,11 @@ async fn responses_handler(
 }
 
 /// Record a non-stream response's cost against the served provider — the real
-/// `cost` if non-zero, otherwise a token×price estimate.
+/// `cost` if non-zero, otherwise a token×price estimate. No-op when tracking is off.
 async fn record_cost(state: &AppState, provider: &str, price: Option<ModelPrice>, resp: &Value) {
+    if !state.usage_enabled() {
+        return;
+    }
     let real = resp.get("cost").and_then(usage::parse_cost);
     let (pt, ct) = usage::tokens_from_usage(resp.get("usage"));
     if let Some(c) = usage::effective_cost(real, price.as_ref(), pt, ct) {
@@ -265,6 +310,9 @@ fn run_stream<E: CanonicalEmitter + Send + 'static>(
     mut emitter: E,
     recorder: Option<CostRecorder>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // Tracking off (`recorder == None`) ⇒ no cost/token capture and no post-[DONE]
+    // drain: the stream behaves exactly as it did before the cost accumulator.
+    let track = recorder.is_some();
     let s = stream! {
         let mut decoder = SseDecoder::default();
         let mut parser = chat::ChatStreamParser::new(response_id);
@@ -285,14 +333,15 @@ fn run_stream<E: CanonicalEmitter + Send + 'static>(
                         match item {
                             SseItem::Data(d) => {
                                 let Ok(json) = serde_json::from_str::<Value>(&d) else { continue };
-                                // Capture cost from any chunk that carries it (Zen: after [DONE]).
-                                if let Some(c) = json.get("cost").and_then(usage::parse_cost) {
-                                    cost = Some(c);
+                                if track {
+                                    // Capture cost (Zen sends it after [DONE]) + token usage.
+                                    if let Some(c) = json.get("cost").and_then(usage::parse_cost) {
+                                        cost = Some(c);
+                                    }
+                                    let (pt, ct) = usage::tokens_from_usage(json.get("usage"));
+                                    if pt.is_some() { ptok = pt; }
+                                    if ct.is_some() { ctok = ct; }
                                 }
-                                // Capture token usage (the `usage` chunk arrives before [DONE]).
-                                let (pt, ct) = usage::tokens_from_usage(json.get("usage"));
-                                if pt.is_some() { ptok = pt; }
-                                if ct.is_some() { ctok = ct; }
                                 if done {
                                     continue; // past [DONE]: sniff cost only, don't emit
                                 }
@@ -312,8 +361,11 @@ fn run_stream<E: CanonicalEmitter + Send + 'static>(
                                     yield Ok(Event::default().event(fr.event).data(fr.data.to_string()));
                                 }
                                 completed = true;
-                                done = true;
-                                // Don't break: drain to upstream EOF to catch the cost chunk.
+                                if track {
+                                    done = true; // keep draining to catch the trailing cost chunk
+                                } else {
+                                    break 'outer; // tracking off: stop at [DONE], no drain
+                                }
                             }
                         }
                     }
@@ -471,7 +523,12 @@ async fn chat_handler(
     let req = chat::parse_request(&body)?;
     let candidates = {
         let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        let exhausted = state.usage.exhausted_set(&cfg.providers, now_secs());
+        // Usage-based demotion only when tracking is on; 429 failover is separate.
+        let exhausted = if state.usage_enabled() {
+            state.usage.exhausted_set(&cfg.providers, now_secs())
+        } else {
+            std::collections::HashSet::new()
+        };
         router::resolve_candidates(&cfg, &status, &exhausted, &req.model)?
     };
 
@@ -517,7 +574,12 @@ async fn messages_handler(
     let response_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let candidates = {
         let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        let exhausted = state.usage.exhausted_set(&cfg.providers, now_secs());
+        // Usage-based demotion only when tracking is on; 429 failover is separate.
+        let exhausted = if state.usage_enabled() {
+            state.usage.exhausted_set(&cfg.providers, now_secs())
+        } else {
+            std::collections::HashSet::new()
+        };
         router::resolve_candidates(&cfg, &status, &exhausted, &req.model)?
     };
     tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, "messages request");
@@ -525,16 +587,12 @@ async fn messages_handler(
     if req.stream {
         let (provider, model, byte_stream) =
             open_upstream_stream(&state, &req, &candidates).await?;
-        let price = price_for(&cfg, &provider, &model);
+        let recorder = cost_recorder(&state, &cfg, provider, &model);
         Ok(run_stream(
             byte_stream,
             response_id,
             anthropic::AnthropicEmitter::new(),
-            Some(CostRecorder {
-                meter: state.usage.clone(),
-                provider,
-                price,
-            }),
+            recorder,
         )
         .into_response())
     } else {

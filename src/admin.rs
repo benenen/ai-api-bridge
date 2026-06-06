@@ -120,6 +120,7 @@ pub async fn list_providers(
 
     let status = state.status.read().ok();
     let now = now_secs();
+    let enabled = state.usage_enabled();
     let mut providers: Vec<Value> = cfg
         .providers
         .iter()
@@ -130,23 +131,37 @@ pub async fn list_providers(
                 .cloned()
                 .unwrap_or_default();
             // Merge each window's config (label/window_secs/limit — for the edit form)
-            // with its live spend (spent/remaining/reset_in_secs — for the bars).
-            let stats = state.usage.windows(name, &p.cost_windows, now);
-            let cost_windows: Vec<Value> = p
-                .cost_windows
-                .iter()
-                .zip(stats)
-                .map(|(w, st)| {
-                    json!({
-                        "label": w.label,
-                        "window_secs": w.window_secs,
-                        "limit": w.limit,
-                        "spent": st.spent,
-                        "remaining": st.remaining,
-                        "reset_in_secs": st.reset_in_secs,
+            // with its live spend (spent/remaining/reset_in_secs — for the bars). The
+            // spend stats are only computed when tracking is on.
+            let cost_windows: Vec<Value> = if enabled {
+                let stats = state.usage.windows(name, &p.cost_windows, now);
+                p.cost_windows
+                    .iter()
+                    .zip(stats)
+                    .map(|(w, st)| {
+                        json!({
+                            "label": w.label,
+                            "window_secs": w.window_secs,
+                            "limit": w.limit,
+                            "spent": st.spent,
+                            "remaining": st.remaining,
+                            "reset_in_secs": st.reset_in_secs,
+                        })
                     })
-                })
-                .collect();
+                    .collect()
+            } else {
+                // tracking off: still show the configured windows (for editing), no spend.
+                p.cost_windows
+                    .iter()
+                    .map(|w| {
+                        json!({
+                            "label": w.label,
+                            "window_secs": w.window_secs,
+                            "limit": w.limit,
+                        })
+                    })
+                    .collect()
+            };
             json!({
                 "name": name,
                 "wire": p.wire.as_str(),
@@ -176,7 +191,41 @@ pub async fn list_providers(
         })
         .collect();
     providers.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    Ok(Json(json!({ "providers": providers })))
+    Ok(Json(
+        json!({ "providers": providers, "cost_tracking": enabled }),
+    ))
+}
+
+/// `GET /admin/api/usage` — current cost/usage tracking state.
+pub async fn get_usage(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, BridgeError> {
+    let cfg = state.config();
+    check_auth(&cfg, &headers)?;
+    Ok(Json(json!({ "enabled": state.usage_enabled() })))
+}
+
+#[derive(Deserialize)]
+pub struct UsageToggle {
+    pub enabled: bool,
+}
+
+/// `POST /admin/api/usage` — flip cost/usage tracking on/off at runtime. The change
+/// is runtime-only; the persistent default is `cost_tracking` in the config file.
+pub async fn set_usage(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<UsageToggle>,
+) -> Result<Json<Value>, BridgeError> {
+    let cfg = state.config();
+    check_auth(&cfg, &headers)?;
+    state.set_usage_enabled(body.enabled);
+    tracing::info!(
+        enabled = body.enabled,
+        "cost/usage tracking toggled via admin"
+    );
+    Ok(Json(json!({ "ok": true, "enabled": body.enabled })))
 }
 
 /// `POST /admin/api/providers` — create.

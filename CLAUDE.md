@@ -83,12 +83,18 @@ wire-format directly:
 - **Admin** (`admin.rs`, reuse `check_auth` / `auth_token`): `GET /` and `/admin` serve the
   embedded management page (`web/admin.html`, `include_str!`). CRUD over the SQLite-backed
   config: `GET/POST /admin/api/providers`, `PUT/DELETE /admin/api/providers/:name`,
-  `GET/POST /admin/api/routes`, `PUT/DELETE /admin/api/routes/:alias`. List masks `api_key`
+  `GET/POST /admin/api/routes`, `PUT/DELETE /admin/api/routes/:alias`,
+  `GET/POST /admin/api/usage` (cost-tracking toggle). List masks `api_key`
   (`api_key_set`); update preserves the stored key when the field is blank. Every write runs
   `server::reload_from_db` — rebuilds the `Config` snapshot, reconciles the watcher
   (`watcher::reconcile` aborts + respawns probe tasks), and prunes the `StatusMap`. Hence
   `AppState.config` is `RwLock<Arc<Config>>`: handlers take an `Arc` snapshot at entry so
   `Resolved<'a>` never borrows across an `.await`.
+- **Cost/usage tracking** (`usage.rs`) is gated by a master switch: `cost_tracking` in the
+  config (default **false** = off) seeds `AppState.usage_on` (`AtomicBool`); the admin page +
+  `POST /admin/api/usage {"enabled":bool}` toggle it at runtime. When off, the record/exposure/
+  usage-failover paths short-circuit at zero overhead; **reactive 429 failover is independent
+  and always on** (`is_retryable` in `server.rs`).
 
 ## Conventions / gotchas
 - Wire-format dispatch is plain functions + a sync `CanonicalEmitter` trait (used as a

@@ -47,6 +47,15 @@ async fn mock_chat_json() -> axum::response::Response {
         .unwrap()
 }
 
+// A non-streaming response carrying a real `cost` (for the usage-toggle test).
+async fn mock_chat_json_cost() -> axum::response::Response {
+    let body = r#"{"model":"m","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":5,"completion_tokens":2},"cost":"0.5"}"#;
+    axum::response::Response::builder()
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
 // A streaming Chat Completions response that makes a tool call.
 async fn mock_chat_tool() -> axum::response::Response {
     let body = concat!(
@@ -97,6 +106,7 @@ model_prefix = "opencode/"
         pool: None,
         watchers: Default::default(),
         usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
+        usage_on: Default::default(),
     })))
     .await;
 
@@ -131,6 +141,7 @@ async fn inband_upstream_error_becomes_response_failed() {
         pool: None,
         watchers: Default::default(),
         usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
+        usage_on: Default::default(),
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -160,6 +171,7 @@ async fn unknown_model_returns_400() {
         pool: None,
         watchers: Default::default(),
         usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
+        usage_on: Default::default(),
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -184,6 +196,7 @@ async fn lists_models() {
         pool: None,
         watchers: Default::default(),
         usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
+        usage_on: Default::default(),
     })))
     .await;
     let body: serde_json::Value = reqwest::get(format!("{url}/v1/models"))
@@ -220,6 +233,7 @@ async fn messages_streaming_end_to_end() {
         pool: None,
         watchers: Default::default(),
         usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
+        usage_on: Default::default(),
     })))
     .await;
 
@@ -257,6 +271,7 @@ async fn messages_non_streaming_end_to_end() {
         pool: None,
         watchers: Default::default(),
         usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
+        usage_on: Default::default(),
     })))
     .await;
 
@@ -291,6 +306,7 @@ async fn messages_tool_use_streaming() {
         pool: None,
         watchers: Default::default(),
         usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
+        usage_on: Default::default(),
     })))
     .await;
 
@@ -323,6 +339,7 @@ async fn messages_missing_model_returns_400() {
         pool: None,
         watchers: Default::default(),
         usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
+        usage_on: Default::default(),
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -356,6 +373,7 @@ fn app(cfg: Config) -> Router {
         pool: None,
         watchers: Default::default(),
         usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
+        usage_on: Default::default(),
     }))
 }
 
@@ -412,4 +430,56 @@ async fn non_retryable_400_does_not_failover() {
         .unwrap();
     // bad returned 400 (not retryable) -> propagated, good never tried
     assert_eq!(resp.status(), 400);
+}
+
+// The cost/usage master switch gates recording: ON records the response's cost,
+// OFF short-circuits (and leaves 429 failover untouched — tested separately).
+#[tokio::test]
+async fn usage_toggle_gates_recording() {
+    use ai_api_bridge::config::CostWindow;
+
+    let upstream_url =
+        spawn(Router::new().route("/chat/completions", post(mock_chat_json_cost))).await;
+    let cfg = Config::from_toml(&format!(
+        "default_provider=\"zen\"\n[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"{upstream_url}\""
+    ))
+    .unwrap();
+
+    async fn spent_after_request(cfg: Config, on: bool) -> f64 {
+        let state = Arc::new(AppState {
+            config: RwLock::new(Arc::new(cfg)),
+            upstream: Upstream::new(),
+            status: Default::default(),
+            pool: None,
+            watchers: Default::default(),
+            usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
+            usage_on: std::sync::atomic::AtomicBool::new(on),
+        });
+        let usage = state.usage.clone();
+        let url = spawn(build_app(state)).await;
+        reqwest::Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&json!({"model": "m", "stream": false, "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let win = CostWindow {
+            label: "5h".into(),
+            window_secs: 18000,
+            limit: 100.0,
+        };
+        usage.windows("zen", &[win], now)[0].spent
+    }
+
+    // tracking ON -> the $0.50 cost is recorded for the served provider
+    assert_eq!(spent_after_request(cfg.clone(), true).await, 0.5);
+    // tracking OFF -> nothing recorded
+    assert_eq!(spent_after_request(cfg, false).await, 0.0);
 }

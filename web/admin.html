@@ -288,6 +288,9 @@
       <span class="sub">control plane</span>
     </div>
     <div class="spacer"></div>
+    <div class="auth-chip" id="usageChip" title="Toggle cost/usage tracking (runtime)">
+      <span class="dot"></span><span id="usageLabel">USAGE —</span>
+    </div>
     <div class="auth-chip" id="authChip" title="Set or change the admin token">
       <span class="dot"></span><span id="authLabel">NO TOKEN</span>
     </div>
@@ -508,6 +511,7 @@ const state = {
   providers: [],
   routes: [],
   modalOpen: false,
+  costTracking: false,
 };
 
 /* ── api ───────────────────────────────────────────────────────── */
@@ -594,7 +598,7 @@ function providerCard(p) {
       hasLimit ? el("div", { class: "bar" }, el("span", { class: barCls, style: "width:" + pct + "%" })) : false,
     ));
   }
-  if (Array.isArray(p.cost_windows) && p.cost_windows.length) {
+  if (state.costTracking && Array.isArray(p.cost_windows) && p.cost_windows.length) {
     const box = el("div", { class: "cost" }, el("div", { class: "cost-head", text: "COST WINDOWS" }));
     p.cost_windows.forEach((w) => {
       const limit = w.limit || 0;
@@ -656,6 +660,8 @@ async function loadAll() {
     const [pr, ro] = await Promise.all([api("GET", "/admin/api/providers"), api("GET", "/admin/api/routes")]);
     state.providers = pr.providers || [];
     state.routes = ro.routes || [];
+    state.costTracking = !!pr.cost_tracking;
+    syncUsageChip();
     renderProviders(); renderRoutes();
   } catch (e) {
     if (e.message.startsWith("Unauthorized")) return;
@@ -668,9 +674,29 @@ async function refreshProviders() {
   try {
     const pr = await api("GET", "/admin/api/providers");
     state.providers = pr.providers || [];
+    state.costTracking = !!pr.cost_tracking;
+    syncUsageChip();
     renderProviders();
   } catch (_) { /* silent on background refresh */ }
 }
+
+function syncUsageChip() {
+  const chip = $("#usageChip");
+  const on = state.costTracking;
+  chip.classList.toggle("set", on);
+  $("#usageLabel").textContent = on ? "USAGE ON" : "USAGE OFF";
+}
+$("#usageChip").addEventListener("click", async () => {
+  try {
+    const r = await api("POST", "/admin/api/usage", { enabled: !state.costTracking });
+    state.costTracking = !!r.enabled;
+    syncUsageChip();
+    toast("ok", "Usage tracking " + (state.costTracking ? "on" : "off"), "");
+    await loadAll();
+  } catch (e) {
+    if (!e.message.startsWith("Unauthorized")) toast("err", "Toggle failed", e.message);
+  }
+});
 
 /* ── modal plumbing ────────────────────────────────────────────── */
 function openScrim(id) { $(id).classList.add("open"); state.modalOpen = true; }
