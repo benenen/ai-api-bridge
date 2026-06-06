@@ -11,8 +11,12 @@ translates each call into an OpenAI **Chat Completions** request to an upstream 
 cp bridge.example.toml bridge.toml
 export BRIDGE_PROVIDERS_ZEN_API_KEY="<your opencode-go Zen key>"
 cargo run --release -- --config bridge.toml
-# listening on 127.0.0.1:8282
+# listening on 127.0.0.1:8282 — open http://127.0.0.1:8282/ for the admin web UI
 ```
+
+Open **`http://127.0.0.1:8282/`** in a browser for the built-in admin dashboard:
+add/edit/delete providers and routes, watch live availability + usage, all without a
+restart. (If `auth_token` is set, the page asks for it once.)
 
 **One running bridge serves both Codex and Claude Code at the same time.** They hit different
 endpoints but share the same `[[routes]]`, so a single alias (`gpt-5.5 → go/deepseek-v4-pro`)
@@ -54,8 +58,24 @@ claude
 - `POST /v1/messages` — Anthropic Messages API (for Claude Code).
 - `POST /v1/chat/completions` — OpenAI Chat Completions (passthrough).
 - `GET /v1/models` — configured aliases.
-- `GET /v1/providers` — per-provider availability + quota (the watcher).
+- `GET /v1/providers` — per-provider availability + quota + usage (the watcher).
 - `GET /health`.
+- **Admin** (reuse `auth_token`): `GET /` `/admin` — the dashboard; `GET/POST /admin/api/providers`
+  + `PUT/DELETE /admin/api/providers/:name`, same for `/admin/api/routes`; `GET/POST /admin/api/usage`
+  — the usage-tracking on/off toggle. Every write takes effect live (no restart).
+
+## Admin web UI
+`GET /` serves a single-page dashboard (embedded in the binary): CRUD for providers + routes,
+live status pills + quota/usage bars, and a runtime toggle for usage tracking. Writes hot-swap
+the running config and restart the watcher — no restart needed.
+
+## Cost / usage tracking (optional, off by default)
+Track per-provider usage in rolling windows by **type** — billing (`$`), request `count`, or
+`token` — and fail over before a window is exhausted. Some vendors (e.g. OpenCode Go) report
+`cost = $0` (subscription), so billing windows can be driven by a token × price estimate.
+It's a master switch (`cost_tracking`, default **false**) — when off, the whole subsystem
+short-circuits at zero overhead and **reactive 429 failover is unaffected**. Toggle it on the
+admin page or via `POST /admin/api/usage`. See [`docs/configuration.md`](docs/configuration.md#usage-tracking-cost--count--token-windows).
 
 ## Monitoring & failover
 A background watcher probes each provider's availability and quota (via a per-provider Lua

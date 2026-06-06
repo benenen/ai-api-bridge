@@ -56,7 +56,8 @@ they live in a SQLite database (`bridge.db` by default; set `database` or `--db`
 | `listen` | string | `127.0.0.1:8282` | Address the bridge binds to. |
 | `database` | string | `bridge.db` | SQLite file holding providers + routes (see [Provider store](#provider-store-sqlite)). Override with `--db`. |
 | `default_provider` | string | — | Provider used when no `[[routes]]` entry matches. Optional, but without it any unrouted model name is a 400. |
-| `auth_token` | string | — | If set, clients must send the token as `Authorization: Bearer <token>` or `x-api-key: <token>` (Claude Code). If unset, any/no token is accepted. |
+| `auth_token` | string | — | If set, clients must send the token as `Authorization: Bearer <token>` or `x-api-key: <token>` (Claude Code). If unset, any/no token is accepted. Also gates the admin API. |
+| `cost_tracking` | bool | `false` | Master switch for [usage tracking](#usage-tracking-cost--count--token-windows). Off = no usage recorded/exposed and no usage-based failover, at zero overhead (429 failover is unaffected). Toggle at runtime on the admin page / `POST /admin/api/usage`. |
 | `[providers.<name>]` | table | — | Upstream providers — **seed the SQLite store** on first run (see above). |
 | `[[routes]]` | array | — | Model alias → provider/model mappings — seed the store on first run. |
 
@@ -83,6 +84,8 @@ routes and by the key env var.
 | `probe_enabled` | bool | on if `probe_script` set | Master switch for monitoring this provider. |
 | `probe_interval_secs` | int | `300` | Seconds between probes. |
 | `quota_min` | float | — | Below this `quota_remaining` the provider counts as exhausted (for failover). |
+| `usage` | array | `[]` | Typed usage limit windows — see [Usage tracking](#usage-tracking-cost--count--token-windows). Empty = not usage-tracked. |
+| `cost_windows` / `model_prices` | — | — | **Legacy** billing shorthand; folded into a `usage` `billing` spec at load. Prefer `usage`. |
 
 ### Provider keys
 
@@ -236,7 +239,82 @@ aren't cut), and a 60s whole-request timeout for non-streaming calls.
 ### Status endpoint
 
 `GET /v1/providers` returns each provider's `available`, `quota_remaining/used/limit`,
-`quota_min`, `last_checked` (epoch secs), `last_ok`, `error`, and `note`.
+`quota_min`, `last_checked` (epoch secs), `last_ok`, `error`, `note`, and `usage` (per-type
+windows, see below). The response also carries a top-level `cost_tracking` flag.
+
+## Usage tracking (cost / count / token windows)
+
+Separately from the watcher's vendor-reported quota, the bridge can **accumulate usage it
+observes** into rolling limit windows and fail over before a window is exhausted. This is
+**off by default** — enable it with the top-level `cost_tracking = true`, or toggle it at
+runtime on the admin page / `POST /admin/api/usage {"enabled": true}`. When off, the whole
+subsystem short-circuits at zero overhead; the **reactive 429 failover is independent and
+always on**.
+
+### Usage types
+
+Each provider's `usage` is a list of typed specs (`usage_type`):
+
+| Type | Unit | Amount recorded per request | Notes |
+|---|---|---|---|
+| `billing` | `usd` | the response's `cost`, or — when that is `$0`/absent — a `tokens × model_prices` estimate | for subscription plans (e.g. OpenCode Go) that report `cost = $0` |
+| `count` | `requests` | `1` | cap request volume |
+| `token` | `tokens` | `prompt_tokens + completion_tokens` | cap token throughput |
+
+Each spec has rolling `windows` (`{label, window_secs, limit}`); `limit` is in the type's
+unit. `spent = Σ amount in the last window_secs`, `remaining = limit − spent`. A provider may
+list several specs (e.g. a `$`-cap and a request-count cap at once).
+
+```toml
+[[providers.go.usage]]
+usage_type = "billing"
+windows = [
+    { label = "5h", window_secs = 18000, limit = 12.0 },   # OpenCode Go: $12 / 5h
+    { label = "7d", window_secs = 604800, limit = 30.0 },
+    { label = "30d", window_secs = 2592000, limit = 60.0 },
+]
+
+[providers.go.usage.model_prices]   # $/1M tokens — drives the billing estimate when cost=$0
+"deepseek-v4-pro" = { input = 0.40, output = 1.60 }
+# … one entry per model id you route to …
+
+[[providers.go.usage]]
+usage_type = "count"
+windows = [{ label = "1d", window_secs = 86400, limit = 500.0 }]   # 500 requests/day
+```
+
+> **Legacy shorthand:** a provider's older `cost_windows = [...]` + `[providers.<name>.model_prices]`
+> still work — they fold into one `billing` spec at load. New configs should use `usage`.
+
+### Exposure + failover
+
+- **Exposed** at `GET /v1/providers` and `GET /admin/api/providers` as `usage: [{usage_type,
+  unit, windows: [{label, limit, spent, remaining, reset_in_secs}]}]` (config-only when
+  tracking is off). The admin page renders one bar section per type.
+- **Failover:** a provider whose **any** window (any unit) has `remaining ≤ 0` is demoted like
+  a watcher-down provider — tried only as a last resort — so traffic moves to a fallback
+  *before* the vendor returns 429.
+
+Events persist to the SQLite `usage_events` table (kept ~31 days) so windows survive a restart.
+
+## Admin web UI
+
+`GET /` (and `/admin`) serves a single-page dashboard embedded in the binary (no runtime CDN —
+works offline). It does full CRUD over the SQLite-backed providers + routes, shows live status
+pills + quota/usage bars, and toggles usage tracking — all gated by `auth_token` (the page
+prompts for it once and keeps it in browser `localStorage`). Backing REST API:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET/POST /admin/api/providers` | List (api_key masked) / create a provider. |
+| `PUT/DELETE /admin/api/providers/:name` | Update (blank `api_key` keeps the stored one) / delete (cascades its routes). |
+| `GET/POST /admin/api/routes` | List / create a route. |
+| `PUT/DELETE /admin/api/routes/:alias` | Update / delete a route. |
+| `GET/POST /admin/api/usage` | Read / set the usage-tracking on-off switch (runtime; the persistent default is `cost_tracking`). |
+
+Every write rebuilds the live config and restarts the watcher in place — **no process restart**.
+(Edits go to the DB, which is authoritative; `bridge.toml` only seeds an empty DB or re-seeds via
+`--reseed`.)
 
 ## Pointing Codex at the bridge
 
@@ -281,8 +359,11 @@ across turns.
 | `POST /v1/messages` | Anthropic Messages API — for Claude Code (`ANTHROPIC_BASE_URL`). |
 | `POST /v1/chat/completions` | OpenAI Chat Completions — verbatim passthrough. |
 | `GET /v1/models` | Lists configured route aliases. |
-| `GET /v1/providers` | Watcher status per provider (availability + quota). |
+| `GET /v1/providers` | Watcher status per provider (availability + quota + usage). |
 | `GET /health` | Liveness check (returns `ok`). |
+| `GET /` · `GET /admin` | [Admin web UI](#admin-web-ui) (dashboard). |
+| `/admin/api/providers[/:name]` · `/admin/api/routes[/:alias]` | Provider/route CRUD (reuse `auth_token`). |
+| `GET/POST /admin/api/usage` | Usage-tracking on/off toggle. |
 
 ## Full example
 
