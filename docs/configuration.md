@@ -209,13 +209,29 @@ Each enabled provider is probed at startup and every `probe_interval_secs` (defa
 `probe_enabled` is the master switch (defaults on when a `probe_script` is set). Probing is
 periodic and out-of-band — it never adds latency to a request.
 
-### Failover
+### Failover (proactive + reactive)
 
-`router::resolve` builds a candidate chain — the route's primary then its `fallback` list —
-and picks the **first usable** one. A provider is skipped when its status is `available =
-false`, or when `quota_remaining` is known and below the provider's `quota_min`. If every
-candidate is degraded, the primary is attempted anyway (and a warning is logged). Providers
-that aren't monitored (no status yet) are assumed usable.
+A request resolves to a **candidate chain** — the route's primary then its `fallback` list
+(in order) — reordered so watcher-usable providers come first. Two layers then apply:
+
+- **Proactive** (watcher status): a candidate is ranked last when its status is
+  `available = false`, or `quota_remaining` is known and below the provider's `quota_min`.
+  Providers that aren't monitored (no status yet) are assumed usable.
+- **Reactive** (this request): the bridge tries candidates in order and, if one **fails at
+  call time**, advances to the next. It retries on connection failure / timeout, **5xx**,
+  **429** (rate-limit), and **401/402** (auth/quota) — but **not** other 4xx (a bad request
+  won't be fixed by retrying elsewhere). For **streaming**, the upstream response headers
+  arrive before any body byte, so a failure is caught *before* anything is sent to the client
+  — once bytes start flowing the response is committed (no retry). On a reactive failure the
+  provider is marked `available = false` immediately, and (if it has a probe) a one-shot
+  re-probe writes the corrected status to map + DB so a transient blip self-heals in seconds.
+
+Each candidate is attempted at most once, in order — total attempts ≤ chain length (no
+backoff loop, no same-provider retry). If every candidate fails, the last error is returned.
+
+Connection/headers timeouts: the upstream client uses a 10s connect timeout, a 30s
+response-**headers** timeout for streaming (the body is never time-capped, so long streams
+aren't cut), and a 60s whole-request timeout for non-streaming calls.
 
 ### Status endpoint
 

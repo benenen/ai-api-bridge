@@ -60,8 +60,10 @@ claude
 ## Monitoring & failover
 A background watcher probes each provider's availability and quota (via a per-provider Lua
 script — see [`probes/`](probes) and `docs/configuration.md`) and exposes it at
-`GET /v1/providers`. A route can declare a `fallback` chain; the router automatically skips
-providers that are down or below their `quota_min` and uses the next one.
+`GET /v1/providers`. A route can declare a `fallback` chain; the bridge fails over both
+**proactively** (skipping providers the watcher marks down / below `quota_min`) and
+**reactively** (if a provider errors mid-request — connection failure, 5xx, 429, 401/402 — it
+switches to the next candidate before the first byte reaches the client).
 
 ## Config
 See [`bridge.example.toml`](bridge.example.toml) for a working template and

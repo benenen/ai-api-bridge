@@ -56,8 +56,12 @@ wire-format directly:
   forwards upstream bytes verbatim via `Body::from_stream` (no re-encoding).
 - `router.rs` — explicit `[[routes]]` win; otherwise the default provider's `model_prefix`
   is applied (`gpt-5.5` -> `opencode/gpt-5.5`) unless the alias already contains `/`.
-  `resolve` also takes the live status map and **fails over** along a route's `fallback`
-  chain, skipping providers that are `available=false` or below `quota_min`.
+  `resolve_candidates` returns the **ordered candidate chain** (route primary + `fallback`,
+  watcher-usable first) for failover. The server's `open_upstream_stream`/`call_upstream_json`
+  try them in order and **reactively** advance on a call-time failure (`is_retryable`:
+  connect/timeout, 5xx, 429, 401/402 — not other 4xx); for streaming the retry happens before
+  the first byte (headers known first). A reactive failure marks the provider down (+ one-shot
+  re-probe via `mark_degraded`). `upstream::ByteStream` is the boxed stream the helpers return.
 - `upstream.rs` — reqwest client; `post_stream` (SSE) and `post_json` (non-stream).
 - `store.rs` — SQLite (sqlx, runtime queries) for providers + routes + `provider_status`.
   `bridge.toml` seeds an empty DB once (`seed_from_config`), then the DB is authoritative;

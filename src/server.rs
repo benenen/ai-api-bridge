@@ -13,20 +13,24 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
+use sqlx::sqlite::SqlitePool;
 
-use crate::canonical::CanonicalEvent;
+use crate::canonical::{CanonicalEvent, CanonicalRequest};
 use crate::config::Config;
 use crate::error::BridgeError;
-use crate::router;
+use crate::router::{self, Resolved};
 use crate::sse::{SseDecoder, SseItem};
-use crate::upstream::Upstream;
+use crate::upstream::{ByteStream, Upstream};
 use crate::watcher::StatusMap;
 use crate::wire::{CanonicalEmitter, anthropic, chat, responses};
+use crate::{probe, store};
 
 pub struct AppState {
     pub config: Config,
     pub upstream: Upstream,
     pub status: StatusMap,
+    /// Live DB handle for reactive re-probes (None in tests).
+    pub pool: Option<SqlitePool>,
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
@@ -104,31 +108,21 @@ async fn responses_handler(
     check_auth(&state, &headers)?;
 
     let req = responses::parse_request(&body)?;
-    let resolved = {
-        let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        router::resolve(&state.config, &status, &req.model)?
-    };
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
-
-    tracing::info!(model = %req.model, provider = %resolved.provider_name,
-        upstream_model = %resolved.upstream_model, stream = req.stream, "responses request");
-
-    let chat_body = chat::build_request(&req, &resolved.upstream_model, resolved.provider);
+    let candidates = {
+        let status = state.status.read().unwrap_or_else(|e| e.into_inner());
+        router::resolve_candidates(&state.config, &status, &req.model)?
+    };
+    tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, "responses request");
 
     if req.stream {
-        let byte_stream = state
-            .upstream
-            .post_stream(resolved.provider, "/chat/completions", &chat_body)
-            .await?;
+        let byte_stream = open_upstream_stream(&state, &req, &candidates).await?;
         Ok(
             run_stream(byte_stream, response_id, responses::ResponsesEmitter::new())
                 .into_response(),
         )
     } else {
-        let upstream_resp = state
-            .upstream
-            .post_json(resolved.provider, "/chat/completions", &chat_body)
-            .await?;
+        let upstream_resp = call_upstream_json(&state, &req, &candidates).await?;
         let events = chat::completion_to_events(&upstream_resp, &response_id);
         let mut emitter = responses::ResponsesEmitter::new();
         for ev in &events {
@@ -200,6 +194,112 @@ fn run_stream<E: CanonicalEmitter + Send + 'static>(
     Sse::new(s)
 }
 
+/// Whether an upstream failure should advance to the next fallback candidate.
+/// (Connection/timeout, 5xx, 429 rate-limit, 401/402 quota — but not other 4xx,
+/// which are bad-request errors that retrying elsewhere won't fix.)
+fn is_retryable(e: &BridgeError) -> bool {
+    match e {
+        BridgeError::UpstreamUnreachable(_) => true,
+        BridgeError::Upstream { status, .. } => {
+            matches!(status, 401 | 402 | 408 | 429) || (500..=599).contains(status)
+        }
+        _ => false,
+    }
+}
+
+/// React to a candidate failing: mark it unavailable in the in-memory status map
+/// now (so concurrent/subsequent requests skip it), and for monitored providers
+/// kick off a one-shot re-probe that writes the corrected status to map + DB.
+fn mark_degraded(state: &AppState, cand: &Resolved<'_>, err: &BridgeError) {
+    if let Ok(mut m) = state.status.write() {
+        let entry = m.entry(cand.provider_name.clone()).or_default();
+        entry.available = false;
+        entry.last_ok = false;
+        entry.error = Some(format!("request failed: {err}"));
+    }
+    if cand.provider.probe_enabled()
+        && let Some(pool) = state.pool.clone()
+    {
+        let name = cand.provider_name.clone();
+        let provider = cand.provider.clone();
+        let status = state.status.clone();
+        tokio::spawn(async move {
+            let s = probe::run_probe(&name, &provider).await;
+            let _ = store::write_status(&pool, &name, &s).await;
+            if let Ok(mut m) = status.write() {
+                m.insert(name, s);
+            }
+        });
+    }
+}
+
+/// Try each candidate's upstream in order until one accepts (2xx), returning the
+/// live byte stream. Response headers arrive before any body byte, so a failure
+/// here means nothing was sent to the client yet — the only safe retry point for
+/// streaming. Once this returns Ok, the caller is committed to that stream.
+async fn open_upstream_stream(
+    state: &AppState,
+    req: &CanonicalRequest,
+    candidates: &[Resolved<'_>],
+) -> Result<ByteStream, BridgeError> {
+    let mut last_err: Option<BridgeError> = None;
+    let n = candidates.len();
+    for (i, cand) in candidates.iter().enumerate() {
+        let chat_body = chat::build_request(req, &cand.upstream_model, cand.provider);
+        match state
+            .upstream
+            .post_stream(cand.provider, "/chat/completions", &chat_body)
+            .await
+        {
+            Ok(stream) => {
+                if i > 0 {
+                    tracing::info!(provider = %cand.provider_name, attempt = i + 1, "reactive failover: upstream accepted");
+                }
+                return Ok(stream);
+            }
+            Err(e) if is_retryable(&e) && i + 1 < n => {
+                tracing::warn!(provider = %cand.provider_name, "upstream failed, trying next: {e}");
+                mark_degraded(state, cand, &e);
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| BridgeError::Internal("no upstream candidates".into())))
+}
+
+/// Non-streaming counterpart of `open_upstream_stream`.
+async fn call_upstream_json(
+    state: &AppState,
+    req: &CanonicalRequest,
+    candidates: &[Resolved<'_>],
+) -> Result<Value, BridgeError> {
+    let mut last_err: Option<BridgeError> = None;
+    let n = candidates.len();
+    for (i, cand) in candidates.iter().enumerate() {
+        let chat_body = chat::build_request(req, &cand.upstream_model, cand.provider);
+        match state
+            .upstream
+            .post_json(cand.provider, "/chat/completions", &chat_body)
+            .await
+        {
+            Ok(json) => {
+                if i > 0 {
+                    tracing::info!(provider = %cand.provider_name, attempt = i + 1, "reactive failover: upstream accepted");
+                }
+                return Ok(json);
+            }
+            Err(e) if is_retryable(&e) && i + 1 < n => {
+                tracing::warn!(provider = %cand.provider_name, "upstream failed, trying next: {e}");
+                mark_degraded(state, cand, &e);
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| BridgeError::Internal("no upstream candidates".into())))
+}
+
 /// Chat Completions inbound: parse → route → call upstream → pass the response
 /// straight through (inbound and outbound are both Chat Completions, so no
 /// response translation is needed; streaming bytes are forwarded verbatim).
@@ -210,27 +310,20 @@ async fn chat_handler(
 ) -> Result<Response, BridgeError> {
     check_auth(&state, &headers)?;
     let req = chat::parse_request(&body)?;
-    let resolved = {
+    let candidates = {
         let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        router::resolve(&state.config, &status, &req.model)?
+        router::resolve_candidates(&state.config, &status, &req.model)?
     };
-    let chat_body = chat::build_request(&req, &resolved.upstream_model, resolved.provider);
 
     if req.stream {
-        let byte_stream = state
-            .upstream
-            .post_stream(resolved.provider, "/chat/completions", &chat_body)
-            .await?;
+        let byte_stream = open_upstream_stream(&state, &req, &candidates).await?;
         let resp = Response::builder()
             .header("content-type", "text/event-stream")
             .body(Body::from_stream(byte_stream))
             .map_err(|e| BridgeError::Internal(e.to_string()))?;
         Ok(resp)
     } else {
-        let resp = state
-            .upstream
-            .post_json(resolved.provider, "/chat/completions", &chat_body)
-            .await?;
+        let resp = call_upstream_json(&state, &req, &candidates).await?;
         Ok(Json(resp).into_response())
     }
 }
@@ -256,31 +349,21 @@ async fn messages_handler(
     check_auth(&state, &headers)?;
 
     let req = anthropic::parse_request(&body)?;
-    let resolved = {
-        let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        router::resolve(&state.config, &status, &req.model)?
-    };
     let response_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-
-    tracing::info!(model = %req.model, provider = %resolved.provider_name,
-        upstream_model = %resolved.upstream_model, stream = req.stream, "messages request");
-
-    let chat_body = chat::build_request(&req, &resolved.upstream_model, resolved.provider);
+    let candidates = {
+        let status = state.status.read().unwrap_or_else(|e| e.into_inner());
+        router::resolve_candidates(&state.config, &status, &req.model)?
+    };
+    tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, "messages request");
 
     if req.stream {
-        let byte_stream = state
-            .upstream
-            .post_stream(resolved.provider, "/chat/completions", &chat_body)
-            .await?;
+        let byte_stream = open_upstream_stream(&state, &req, &candidates).await?;
         Ok(
             run_stream(byte_stream, response_id, anthropic::AnthropicEmitter::new())
                 .into_response(),
         )
     } else {
-        let upstream_resp = state
-            .upstream
-            .post_json(resolved.provider, "/chat/completions", &chat_body)
-            .await?;
+        let upstream_resp = call_upstream_json(&state, &req, &candidates).await?;
         let events = chat::completion_to_events(&upstream_resp, &response_id);
         let mut emitter = anthropic::AnthropicEmitter::new();
         for ev in &events {

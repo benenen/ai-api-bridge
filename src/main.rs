@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         config,
         upstream: Upstream::new(),
         status,
+        pool: Some(pool),
     });
     let app = build_app(state);
 

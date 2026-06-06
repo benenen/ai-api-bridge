@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::post;
 use serde_json::json;
 
@@ -59,6 +61,14 @@ async fn mock_chat_tool() -> axum::response::Response {
         .unwrap()
 }
 
+// Upstreams that fail with a fixed status (for reactive failover tests).
+async fn mock_503() -> axum::response::Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "down").into_response()
+}
+async fn mock_400() -> axum::response::Response {
+    (StatusCode::BAD_REQUEST, "bad request").into_response()
+}
+
 async fn spawn(app: Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -84,6 +94,7 @@ model_prefix = "opencode/"
         config: cfg,
         upstream: Upstream::new(),
         status: Default::default(),
+        pool: None,
     })))
     .await;
 
@@ -115,6 +126,7 @@ async fn inband_upstream_error_becomes_response_failed() {
         config: cfg,
         upstream: Upstream::new(),
         status: Default::default(),
+        pool: None,
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -141,6 +153,7 @@ async fn unknown_model_returns_400() {
         config: cfg,
         upstream: Upstream::new(),
         status: Default::default(),
+        pool: None,
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -162,6 +175,7 @@ async fn lists_models() {
         config: cfg,
         upstream: Upstream::new(),
         status: Default::default(),
+        pool: None,
     })))
     .await;
     let body: serde_json::Value = reqwest::get(format!("{url}/v1/models"))
@@ -195,6 +209,7 @@ async fn messages_streaming_end_to_end() {
         config: cfg,
         upstream: Upstream::new(),
         status: Default::default(),
+        pool: None,
     })))
     .await;
 
@@ -229,6 +244,7 @@ async fn messages_non_streaming_end_to_end() {
         config: cfg,
         upstream: Upstream::new(),
         status: Default::default(),
+        pool: None,
     })))
     .await;
 
@@ -260,6 +276,7 @@ async fn messages_tool_use_streaming() {
         config: cfg,
         upstream: Upstream::new(),
         status: Default::default(),
+        pool: None,
     })))
     .await;
 
@@ -289,6 +306,7 @@ async fn messages_missing_model_returns_400() {
         config: cfg,
         upstream: Upstream::new(),
         status: Default::default(),
+        pool: None,
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -297,5 +315,83 @@ async fn messages_missing_model_returns_400() {
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+// --- reactive failover (per-request errors) ---
+
+// Route gpt-5.5 -> `bad` (primary) with `good` as fallback; both providers point
+// at the given mock upstreams.
+fn failover_cfg(bad: &str, good: &str) -> Config {
+    Config::from_toml(&format!(
+        "[providers.bad]\nwire=\"openai-chat\"\nbase_url=\"{bad}\"\n\
+         [providers.good]\nwire=\"openai-chat\"\nbase_url=\"{good}\"\n\
+         [[routes]]\nalias=\"gpt-5.5\"\nprovider=\"bad\"\nmodel=\"x\"\n\
+         fallback=[{{ provider=\"good\", model=\"deepseek-v4-pro\" }}]"
+    ))
+    .unwrap()
+}
+
+fn app(cfg: Config) -> Router {
+    build_app(Arc::new(AppState {
+        config: cfg,
+        upstream: Upstream::new(),
+        status: Default::default(),
+        pool: None,
+    }))
+}
+
+#[tokio::test]
+async fn reactive_failover_streaming_on_503() {
+    let good = spawn(Router::new().route("/chat/completions", post(mock_chat))).await;
+    let bad = spawn(Router::new().route("/chat/completions", post(mock_503))).await;
+    let url = spawn(app(failover_cfg(&bad, &good))).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{url}/v1/responses"))
+        .json(&json!({"model": "gpt-5.5", "input": "hi", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let text = resp.text().await.unwrap();
+    // bad 503'd before any byte -> failed over to good's SSE
+    assert!(text.contains("event: response.completed"), "got: {text}");
+    assert!(text.contains("Hello"));
+    assert!(text.contains("world"));
+}
+
+#[tokio::test]
+async fn reactive_failover_non_streaming_on_503() {
+    let good = spawn(Router::new().route("/chat/completions", post(mock_chat_json))).await;
+    let bad = spawn(Router::new().route("/chat/completions", post(mock_503))).await;
+    let url = spawn(app(failover_cfg(&bad, &good))).await;
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .post(format!("{url}/v1/responses"))
+        .json(&json!({"model": "gpt-5.5", "input": "hi", "stream": false}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["content"][0]["text"], "Hello world");
+}
+
+#[tokio::test]
+async fn non_retryable_400_does_not_failover() {
+    let good = spawn(Router::new().route("/chat/completions", post(mock_chat_json))).await;
+    let bad = spawn(Router::new().route("/chat/completions", post(mock_400))).await;
+    let url = spawn(app(failover_cfg(&bad, &good))).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{url}/v1/responses"))
+        .json(&json!({"model": "gpt-5.5", "input": "hi", "stream": false}))
+        .send()
+        .await
+        .unwrap();
+    // bad returned 400 (not retryable) -> propagated, good never tried
     assert_eq!(resp.status(), 400);
 }
