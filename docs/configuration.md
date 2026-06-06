@@ -27,19 +27,38 @@ Setup for each: [Pointing Codex at the bridge](#pointing-codex-at-the-bridge) ·
 
 - The file is selected with `--config <path>` (default: `bridge.toml` in the working dir).
 - `--listen <host:port>` overrides the `listen` value from the file.
+- `--db <path>` overrides the SQLite database path (default: the `database` key).
 - Secrets can be supplied by environment variable instead of being written into the
   file (see [Provider keys](#provider-keys)). **Keep `bridge.toml` out of git** — it is
   already in `.gitignore` because it holds API keys.
+
+## Provider store (SQLite)
+
+`[providers.<name>]` and `[[routes]]` are **not re-read from `bridge.toml` on every run** —
+they live in a SQLite database (`bridge.db` by default; set `database` or `--db`):
+
+- **First run** (empty DB): the `[providers]` / `[[routes]]` in `bridge.toml` are imported
+  into the DB once (seed).
+- **After that the DB is the source of truth.** Editing those two sections in `bridge.toml`
+  has no effect — edit the DB directly, or run with `--reseed` to wipe both tables and
+  re-import from `bridge.toml`.
+- `BRIDGE_PROVIDERS_<NAME>_API_KEY` env vars are applied **after** the DB load, so a key
+  supplied only via env is never persisted to the DB.
+- The other top-level keys (`listen`, `default_provider`, `auth_token`, `database`) are
+  always read from `bridge.toml`, never the DB.
+
+`bridge.db` holds provider API keys, so it is gitignored like `bridge.toml`.
 
 ## Top-level keys
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `listen` | string | `127.0.0.1:8282` | Address the bridge binds to. |
+| `database` | string | `bridge.db` | SQLite file holding providers + routes (see [Provider store](#provider-store-sqlite)). Override with `--db`. |
 | `default_provider` | string | — | Provider used when no `[[routes]]` entry matches. Optional, but without it any unrouted model name is a 400. |
-| `auth_token` | string | — | If set, clients must send `Authorization: Bearer <auth_token>`. If unset, any/no token is accepted. |
-| `[providers.<name>]` | table | — | One or more upstream providers (see below). |
-| `[[routes]]` | array | — | Model alias → provider/model mappings (see below). |
+| `auth_token` | string | — | If set, clients must send the token as `Authorization: Bearer <token>` or `x-api-key: <token>` (Claude Code). If unset, any/no token is accepted. |
+| `[providers.<name>]` | table | — | Upstream providers — **seed the SQLite store** on first run (see above). |
+| `[[routes]]` | array | — | Model alias → provider/model mappings — seed the store on first run. |
 
 ```toml
 listen = "127.0.0.1:8282"

@@ -65,6 +65,10 @@ In short: keys are set inline (`api_key` under a provider) or via
 `BRIDGE_PROVIDERS_<NAME>_API_KEY` (e.g. `BRIDGE_PROVIDERS_GO_API_KEY`); model names map to
 the upstream by the provider's `model_prefix`, or per-alias via `[[routes]]`.
 
+**Providers + routes are stored in SQLite** (`bridge.db`): `bridge.toml` seeds the DB on
+first run, then the DB is authoritative (re-run with `--reseed` to re-import from the file).
+`listen` / `default_provider` / `auth_token` stay in `bridge.toml`.
+
 ## Architecture
 See `docs/superpowers/specs/2026-06-05-ai-api-bridge-design.md` and
 `docs/superpowers/plans/2026-06-05-ai-api-bridge.md`.

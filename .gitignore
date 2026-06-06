@@ -26,3 +26,8 @@ target
 /target
 
 bridge.toml
+
+# Local SQLite store (providers/routes + secrets)
+bridge.db
+bridge.db-shm
+bridge.db-wal

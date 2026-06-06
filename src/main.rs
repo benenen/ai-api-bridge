@@ -5,6 +5,7 @@ use clap::Parser;
 
 use ai_api_bridge::config::Config;
 use ai_api_bridge::server::{AppState, build_app};
+use ai_api_bridge::store;
 use ai_api_bridge::upstream::Upstream;
 
 #[derive(Parser, Debug)]
@@ -16,6 +17,12 @@ struct Cli {
     /// Override the listen address (host:port)
     #[arg(long)]
     listen: Option<String>,
+    /// Override the SQLite database path (default: `database` in the config file)
+    #[arg(long)]
+    db: Option<String>,
+    /// Wipe the providers/routes tables and re-import them from the config file
+    #[arg(long)]
+    reseed: bool,
 }
 
 #[tokio::main]
@@ -33,6 +40,34 @@ async fn main() -> anyhow::Result<()> {
         config.listen = listen;
     }
     let addr = config.listen.clone();
+
+    // Providers + routes live in SQLite. bridge.toml seeds an empty DB once; the DB
+    // is authoritative thereafter. Env api-key overrides are applied last so secrets
+    // supplied via env never get persisted to the DB.
+    let db_path = cli.db.unwrap_or_else(|| config.database.clone());
+    let pool = store::open(&db_path).await?;
+    if cli.reseed {
+        store::clear(&pool).await?;
+        tracing::info!("--reseed: cleared providers/routes, re-importing from config");
+    }
+    if store::is_empty(&pool).await? {
+        store::seed_from_config(&pool, &config).await?;
+        tracing::info!(
+            providers = config.providers.len(),
+            routes = config.routes.len(),
+            "seeded providers/routes from {}",
+            cli.config.display()
+        );
+    }
+    store::load_into_config(&pool, &mut config).await?;
+    config.apply_env_overrides();
+    pool.close().await;
+    tracing::info!(
+        db = %db_path,
+        providers = config.providers.len(),
+        routes = config.routes.len(),
+        "loaded providers/routes from DB"
+    );
 
     let state = Arc::new(AppState {
         config,

@@ -7,6 +7,10 @@ use std::collections::HashMap;
 pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// SQLite database file holding providers + routes (seeded from this config on
+    /// first run, then authoritative). Overridable with `--db`.
+    #[serde(default = "default_database")]
+    pub database: String,
     pub default_provider: Option<String>,
     pub auth_token: Option<String>,
     #[serde(default)]
@@ -17,6 +21,10 @@ pub struct Config {
 
 fn default_listen() -> String {
     "127.0.0.1:8282".to_string()
+}
+
+fn default_database() -> String {
+    "bridge.db".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,8 +62,7 @@ pub struct Route {
 
 impl Config {
     pub fn from_toml(text: &str) -> anyhow::Result<Config> {
-        let mut cfg: Config = toml::from_str(text)?;
-        cfg.apply_env_overrides();
+        let cfg: Config = toml::from_str(text)?;
         Ok(cfg)
     }
 
@@ -65,7 +72,9 @@ impl Config {
         Config::from_toml(&text)
     }
 
-    fn apply_env_overrides(&mut self) {
+    /// Overlay `BRIDGE_PROVIDERS_<NAME>_API_KEY` env vars onto provider keys.
+    /// Applied after the DB load so env-only secrets never get persisted.
+    pub fn apply_env_overrides(&mut self) {
         for (name, provider) in self.providers.iter_mut() {
             let key = format!("BRIDGE_PROVIDERS_{}_API_KEY", name.to_uppercase());
             if let Ok(val) = std::env::var(&key) {

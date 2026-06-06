@@ -15,7 +15,9 @@ backs both. Purpose: use an OpenCode Zen account inside both Codex and Claude Co
 
 ## Commands
 - Build: `cargo build` (release: `cargo build --release`)
-- Run: `cargo run -- --config bridge.toml` (override port: `--listen 127.0.0.1:8282`)
+- Run: `cargo run -- --config bridge.toml` (override port: `--listen 127.0.0.1:8282`,
+  DB path: `--db bridge.db`)
+- Re-import providers/routes from the config into the DB: `cargo run -- --reseed`
 - Test (all): `cargo test`
 - One test: `cargo test wire::responses::tests::emits_message_sequence_for_text`
 - One module: `cargo test wire::chat::tests`
@@ -55,6 +57,12 @@ wire-format directly:
 - `router.rs` — explicit `[[routes]]` win; otherwise the default provider's `model_prefix`
   is applied (`gpt-5.5` -> `opencode/gpt-5.5`) unless the alias already contains `/`.
 - `upstream.rs` — reqwest client; `post_stream` (SSE) and `post_json` (non-stream).
+- `store.rs` — SQLite (sqlx, runtime queries) for providers + routes. `bridge.toml` seeds
+  an empty DB once (`seed_from_config`), then the DB is authoritative; `main` runs
+  `open` → seed-if-`is_empty` → `load_into_config` → `apply_env_overrides`, all at startup
+  (no per-request DB hit; pool is dropped before serving). `migrations/` holds the schema;
+  `--reseed` clears + re-imports. The router/server are unchanged — they still read the
+  in-memory `Config`.
 
 ## Endpoints
 `POST /v1/responses` (Codex) · `POST /v1/messages` (Anthropic Messages, for Claude Code) ·
