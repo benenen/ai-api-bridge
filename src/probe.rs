@@ -212,6 +212,7 @@ mod tests {
             quota_min: None,
             cost_windows: Vec::new(),
             model_prices: HashMap::new(),
+            usage: Vec::new(),
         }
     }
 

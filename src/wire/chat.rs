@@ -407,6 +407,7 @@ mod tests {
             quota_min: None,
             cost_windows: Vec::new(),
             model_prices: std::collections::HashMap::new(),
+            usage: Vec::new(),
         }
     }
 

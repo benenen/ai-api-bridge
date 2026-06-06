@@ -66,8 +66,14 @@ pub struct Provider {
     /// Per-model pay-as-you-go prices, keyed by the upstream model name. Used to
     /// estimate spend (tokens × price) when the upstream reports `cost = $0` — as
     /// subscription plans like Zen Go do. Real non-zero `cost` always wins.
+    /// DEPRECATED: folded into a `Billing` [`UsageSpec`] at load (see `normalize_usage`).
     #[serde(default)]
     pub model_prices: HashMap<String, ModelPrice>,
+    /// Typed usage specs (billing $, request count, token count …), each a set of
+    /// rolling limit windows. Empty = the provider is not usage-tracked. Legacy
+    /// `cost_windows`/`model_prices` are folded into a `Billing` spec at load.
+    #[serde(default)]
+    pub usage: Vec<UsageSpec>,
 }
 
 /// Pay-as-you-go price for one model, in dollars per 1M tokens.
@@ -97,6 +103,102 @@ pub struct CostWindow {
     pub limit: f64,
 }
 
+/// The "currency" a provider is metered in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageKind {
+    /// Dollars (real `cost` or token × price estimate).
+    Billing,
+    /// Request count (1 per request).
+    Count,
+    /// Token count (prompt + completion).
+    Token,
+}
+
+impl UsageKind {
+    /// The display unit for this kind.
+    pub fn unit(self) -> &'static str {
+        match self {
+            UsageKind::Billing => "usd",
+            UsageKind::Count => "requests",
+            UsageKind::Token => "tokens",
+        }
+    }
+
+    /// The persisted/exposed tag for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsageKind::Billing => "billing",
+            UsageKind::Count => "count",
+            UsageKind::Token => "token",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<UsageKind> {
+        match s {
+            "billing" => Some(UsageKind::Billing),
+            "count" => Some(UsageKind::Count),
+            "token" => Some(UsageKind::Token),
+            _ => None,
+        }
+    }
+}
+
+/// One rolling limit window for any usage kind. `limit` is in the kind's unit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageWindow {
+    pub label: String,
+    pub window_secs: u64,
+    pub limit: f64,
+}
+
+/// A typed usage spec: a usage kind plus its rolling windows (and, for billing, the
+/// per-model prices used to estimate spend). Serializes as `{usage_type, …data}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "usage_type", rename_all = "snake_case")]
+pub enum UsageSpec {
+    Billing {
+        #[serde(default)]
+        windows: Vec<UsageWindow>,
+        #[serde(default)]
+        model_prices: HashMap<String, ModelPrice>,
+    },
+    Count {
+        #[serde(default)]
+        windows: Vec<UsageWindow>,
+    },
+    Token {
+        #[serde(default)]
+        windows: Vec<UsageWindow>,
+    },
+}
+
+impl UsageSpec {
+    pub fn kind(&self) -> UsageKind {
+        match self {
+            UsageSpec::Billing { .. } => UsageKind::Billing,
+            UsageSpec::Count { .. } => UsageKind::Count,
+            UsageSpec::Token { .. } => UsageKind::Token,
+        }
+    }
+
+    pub fn windows(&self) -> &[UsageWindow] {
+        match self {
+            UsageSpec::Billing { windows, .. }
+            | UsageSpec::Count { windows }
+            | UsageSpec::Token { windows } => windows,
+        }
+    }
+
+    /// Per-model prices (billing specs only) for the token × price estimate.
+    pub fn model_prices(&self) -> Option<&HashMap<String, ModelPrice>> {
+        match self {
+            UsageSpec::Billing { model_prices, .. } => Some(model_prices),
+            _ => None,
+        }
+    }
+}
+
 fn default_max_tokens_field() -> String {
     "max_tokens".to_string()
 }
@@ -110,6 +212,27 @@ impl Provider {
     /// Probe interval (default 300s).
     pub fn probe_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.probe_interval_secs.unwrap_or(300).max(1))
+    }
+
+    /// Fold legacy `cost_windows`/`model_prices` into a `Billing` [`UsageSpec`] when
+    /// `usage` is empty, so old configs/DB rows keep working. Idempotent.
+    pub fn normalize_usage(&mut self) {
+        if self.usage.is_empty() && (!self.cost_windows.is_empty() || !self.model_prices.is_empty())
+        {
+            let windows = self
+                .cost_windows
+                .iter()
+                .map(|w| UsageWindow {
+                    label: w.label.clone(),
+                    window_secs: w.window_secs,
+                    limit: w.limit,
+                })
+                .collect();
+            self.usage = vec![UsageSpec::Billing {
+                windows,
+                model_prices: self.model_prices.clone(),
+            }];
+        }
     }
 }
 
@@ -162,7 +285,10 @@ pub struct RouteTarget {
 
 impl Config {
     pub fn from_toml(text: &str) -> anyhow::Result<Config> {
-        let cfg: Config = toml::from_str(text)?;
+        let mut cfg: Config = toml::from_str(text)?;
+        for p in cfg.providers.values_mut() {
+            p.normalize_usage();
+        }
         Ok(cfg)
     }
 

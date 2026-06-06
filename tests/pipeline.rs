@@ -436,12 +436,13 @@ async fn non_retryable_400_does_not_failover() {
 // OFF short-circuits (and leaves 429 failover untouched — tested separately).
 #[tokio::test]
 async fn usage_toggle_gates_recording() {
-    use ai_api_bridge::config::CostWindow;
+    use ai_api_bridge::config::{UsageKind, UsageWindow};
 
     let upstream_url =
         spawn(Router::new().route("/chat/completions", post(mock_chat_json_cost))).await;
+    // zen carries a billing window (folds from cost_windows) so cost is recorded.
     let cfg = Config::from_toml(&format!(
-        "default_provider=\"zen\"\n[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"{upstream_url}\""
+        "default_provider=\"zen\"\n[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"{upstream_url}\"\ncost_windows=[{{label=\"5h\",window_secs=18000,limit=100.0}}]"
     ))
     .unwrap();
 
@@ -470,16 +471,67 @@ async fn usage_toggle_gates_recording() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let win = CostWindow {
+        let win = UsageWindow {
             label: "5h".into(),
             window_secs: 18000,
             limit: 100.0,
         };
-        usage.windows("zen", &[win], now)[0].spent
+        usage.windows("zen", UsageKind::Billing, &[win], now)[0].spent
     }
 
     // tracking ON -> the $0.50 cost is recorded for the served provider
     assert_eq!(spent_after_request(cfg.clone(), true).await, 0.5);
     // tracking OFF -> nothing recorded
     assert_eq!(spent_after_request(cfg, false).await, 0.0);
+}
+
+// A `count` usage spec increments by 1 per request (no cost needed).
+#[tokio::test]
+async fn count_usage_increments_per_request() {
+    use ai_api_bridge::config::{UsageKind, UsageWindow};
+
+    let upstream_url = spawn(Router::new().route("/chat/completions", post(mock_chat_json))).await;
+    let cfg = Config::from_toml(&format!(
+        "default_provider=\"zen\"\n[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"{upstream_url}\"\n[[providers.zen.usage]]\nusage_type=\"count\"\nwindows=[{{label=\"1d\",window_secs=86400,limit=500.0}}]"
+    ))
+    .unwrap();
+    // sanity: the count spec parsed
+    assert_eq!(cfg.providers["zen"].usage.len(), 1);
+
+    let state = Arc::new(AppState {
+        config: RwLock::new(Arc::new(cfg)),
+        upstream: Upstream::new(),
+        status: Default::default(),
+        pool: None,
+        watchers: Default::default(),
+        usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
+        usage_on: std::sync::atomic::AtomicBool::new(true),
+    });
+    let usage = state.usage.clone();
+    let url = spawn(build_app(state)).await;
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        client
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&json!({"model": "m", "stream": false, "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let win = UsageWindow {
+        label: "1d".into(),
+        window_secs: 86400,
+        limit: 500.0,
+    };
+    assert_eq!(
+        usage.windows("zen", UsageKind::Count, &[win], now)[0].spent,
+        2.0
+    );
 }

@@ -46,8 +46,8 @@ pub async fn seed_from_config(pool: &SqlitePool, cfg: &Config) -> anyhow::Result
             "INSERT INTO providers \
              (name, wire, base_url, api_key, model_prefix, max_tokens_field, extra_headers, \
               probe_script, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
-              model_prices) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              model_prices, usage) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(name.as_str())
         .bind(wire_to_str(p.wire))
@@ -62,6 +62,7 @@ pub async fn seed_from_config(pool: &SqlitePool, cfg: &Config) -> anyhow::Result
         .bind(p.quota_min)
         .bind(serde_json::to_string(&p.cost_windows)?)
         .bind(serde_json::to_string(&p.model_prices)?)
+        .bind(serde_json::to_string(&p.usage)?)
         .execute(&mut *tx)
         .await?;
     }
@@ -117,7 +118,7 @@ pub async fn load_into_config(pool: &SqlitePool, cfg: &mut Config) -> anyhow::Re
 fn row_to_provider(r: ProviderRow) -> anyhow::Result<Provider> {
     let extra_headers: HashMap<String, String> =
         serde_json::from_str(&r.extra_headers).unwrap_or_default();
-    Ok(Provider {
+    let mut p = Provider {
         wire: str_to_wire(&r.wire)?,
         base_url: r.base_url,
         api_key: r.api_key,
@@ -130,12 +131,15 @@ fn row_to_provider(r: ProviderRow) -> anyhow::Result<Provider> {
         quota_min: r.quota_min,
         cost_windows: serde_json::from_str(&r.cost_windows).unwrap_or_default(),
         model_prices: serde_json::from_str(&r.model_prices).unwrap_or_default(),
-    })
+        usage: serde_json::from_str(&r.usage).unwrap_or_default(),
+    };
+    p.normalize_usage(); // fold legacy cost_windows/model_prices when `usage` is empty
+    Ok(p)
 }
 
 const PROVIDER_COLS: &str = "name, wire, base_url, api_key, model_prefix, max_tokens_field, \
      extra_headers, probe_script, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
-     model_prices";
+     model_prices, usage";
 
 /// Fetch one provider by name (used by the admin update path to read the stored
 /// `api_key` when the form leaves it blank).
@@ -156,8 +160,8 @@ pub async fn insert_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
         "INSERT INTO providers \
          (name, wire, base_url, api_key, model_prefix, max_tokens_field, extra_headers, \
           probe_script, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
-          model_prices) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          model_prices, usage) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(name)
     .bind(wire_to_str(p.wire))
@@ -172,6 +176,7 @@ pub async fn insert_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
     .bind(p.quota_min)
     .bind(serde_json::to_string(&p.cost_windows)?)
     .bind(serde_json::to_string(&p.model_prices)?)
+    .bind(serde_json::to_string(&p.usage)?)
     .execute(pool)
     .await?;
     Ok(())
@@ -184,7 +189,7 @@ pub async fn update_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
         "UPDATE providers SET \
            wire = ?, base_url = ?, api_key = ?, model_prefix = ?, max_tokens_field = ?, \
            extra_headers = ?, probe_script = ?, probe_enabled = ?, probe_interval_secs = ?, \
-           quota_min = ?, cost_windows = ?, model_prices = ? \
+           quota_min = ?, cost_windows = ?, model_prices = ?, usage = ? \
          WHERE name = ?",
     )
     .bind(wire_to_str(p.wire))
@@ -199,6 +204,7 @@ pub async fn update_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
     .bind(p.quota_min)
     .bind(serde_json::to_string(&p.cost_windows)?)
     .bind(serde_json::to_string(&p.model_prices)?)
+    .bind(serde_json::to_string(&p.usage)?)
     .bind(name)
     .execute(pool)
     .await?;
@@ -249,39 +255,43 @@ pub async fn delete_route(pool: &SqlitePool, alias: &str) -> anyhow::Result<u64>
     Ok(res.rows_affected())
 }
 
-/// Append one cost event (per-request spend) for the cost accumulator.
+/// Append one typed usage event (per-request amount in the kind's unit).
 pub async fn insert_usage_event(
     pool: &SqlitePool,
     provider: &str,
     ts: i64,
-    cost: f64,
+    usage_type: &str,
+    amount: f64,
 ) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO usage_events (provider, ts, cost) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO usage_events (provider, ts, usage_type, amount) VALUES (?, ?, ?, ?)")
         .bind(provider)
         .bind(ts)
-        .bind(cost)
+        .bind(usage_type)
+        .bind(amount)
         .execute(pool)
         .await?;
     Ok(())
 }
 
-/// Load cost events at or after `since` (seeds the in-memory meter at startup).
+/// Load usage events at or after `since` — `(provider, ts, usage_type, amount)`.
+/// Seeds the in-memory meter at startup.
 pub async fn load_usage_events(
     pool: &SqlitePool,
     since: i64,
-) -> anyhow::Result<Vec<(String, i64, f64)>> {
-    let rows: Vec<UsageRow> =
-        sqlx::query_as("SELECT provider, ts, cost FROM usage_events WHERE ts >= ? ORDER BY ts")
-            .bind(since)
-            .fetch_all(pool)
-            .await?;
+) -> anyhow::Result<Vec<(String, i64, String, f64)>> {
+    let rows: Vec<UsageRow> = sqlx::query_as(
+        "SELECT provider, ts, usage_type, amount FROM usage_events WHERE ts >= ? ORDER BY ts",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .into_iter()
-        .map(|r| (r.provider, r.ts, r.cost))
+        .map(|r| (r.provider, r.ts, r.usage_type, r.amount))
         .collect())
 }
 
-/// Delete cost events older than `before` (retention pruning). Returns rows removed.
+/// Delete usage events older than `before` (retention pruning). Returns rows removed.
 pub async fn prune_usage_events(pool: &SqlitePool, before: i64) -> anyhow::Result<u64> {
     let res = sqlx::query("DELETE FROM usage_events WHERE ts < ?")
         .bind(before)
@@ -294,7 +304,8 @@ pub async fn prune_usage_events(pool: &SqlitePool, before: i64) -> anyhow::Resul
 struct UsageRow {
     provider: String,
     ts: i64,
-    cost: f64,
+    usage_type: String,
+    amount: f64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -312,6 +323,7 @@ struct ProviderRow {
     quota_min: Option<f64>,
     cost_windows: String,
     model_prices: String,
+    usage: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -549,6 +561,7 @@ fallback = [{ provider = "zen", model = "gpt-5.5" }]
                     output: 1.6,
                 },
             )]),
+            usage: Vec::new(),
         }
     }
 
@@ -728,18 +741,49 @@ fallback = [{ provider = "zen", model = "gpt-5.5" }]
     #[tokio::test]
     async fn usage_events_insert_load_prune() {
         let pool = temp_pool().await;
-        insert_usage_event(&pool, "go", 100, 1.5).await.unwrap();
-        insert_usage_event(&pool, "go", 200, 2.0).await.unwrap();
-        insert_usage_event(&pool, "zen", 150, 0.5).await.unwrap();
+        insert_usage_event(&pool, "go", 100, "billing", 1.5)
+            .await
+            .unwrap();
+        insert_usage_event(&pool, "go", 200, "count", 1.0)
+            .await
+            .unwrap();
+        insert_usage_event(&pool, "zen", 150, "billing", 0.5)
+            .await
+            .unwrap();
 
-        assert_eq!(load_usage_events(&pool, 0).await.unwrap().len(), 3);
+        let all = load_usage_events(&pool, 0).await.unwrap();
+        assert_eq!(all.len(), 3);
+        // tuple is (provider, ts, usage_type, amount)
+        assert!(
+            all.iter()
+                .any(|(p, _, k, a)| p == "go" && k == "count" && *a == 1.0)
+        );
         // since-filter: ts >= 150 keeps the 200 and 150 events
         assert_eq!(load_usage_events(&pool, 150).await.unwrap().len(), 2);
         // prune ts < 150 removes only the 100 event
         assert_eq!(prune_usage_events(&pool, 150).await.unwrap(), 1);
-        let left = load_usage_events(&pool, 0).await.unwrap();
-        assert_eq!(left.len(), 2);
-        assert_eq!(left.iter().map(|(_, _, c)| c).sum::<f64>(), 2.5);
+        assert_eq!(load_usage_events(&pool, 0).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_cost_windows_fold_to_billing_spec() {
+        let pool = temp_pool().await;
+        // sample_provider sets cost_windows + model_prices, usage empty -> folds on load.
+        insert_provider(&pool, "go", &sample_provider("https://go"))
+            .await
+            .unwrap();
+        let got = get_provider(&pool, "go").await.unwrap().unwrap();
+        assert_eq!(got.usage.len(), 1);
+        match &got.usage[0] {
+            crate::config::UsageSpec::Billing {
+                windows,
+                model_prices,
+            } => {
+                assert_eq!(windows[0].label, "5h");
+                assert!(model_prices.contains_key("deepseek-v4-pro"));
+            }
+            other => panic!("expected Billing spec, got {other:?}"),
+        }
     }
 
     #[tokio::test]

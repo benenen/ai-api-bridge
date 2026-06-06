@@ -63,20 +63,24 @@ model_prefix = ""                   # model names passed through unchanged
 probe_script = "probes/opencode-zen.lua"   # availability via /models (Zen has no quota API)
 probe_interval_secs = 300
 # quota_min = 1.0                   # for vendors with a real quota: failover when below this
-# --- cost windows (optional): Zen has no usage API, so the bridge accumulates each
-# completion's `cost` into rolling spend caps. OpenCode Go = $12/5h, $30/7d, $60/30d.
-# A window's remaining hitting 0 makes this provider fail over (before a 429). Spend +
-# remaining per window show at GET /v1/providers and on the admin page.
-cost_windows = [
-    { label = "5h", window_secs = 18000, limit = 12.0 },
-    { label = "7d", window_secs = 604800, limit = 30.0 },
-    { label = "30d", window_secs = 2592000, limit = 60.0 },
+# --- usage (optional): typed rolling limit windows. `usage_type` is billing ($),
+# count (requests), or token. A window hitting remaining 0 (any unit) fails this
+# provider over (before a 429). Spend/remaining per window show at GET /v1/providers
+# and on the admin page. (Legacy `cost_windows`/`model_prices` still work — they fold
+# into a `billing` spec at load.)
+#
+# billing: Zen has no usage API and Go reports cost=$0 (subscription), so the bridge
+# estimates spend as tokens × model_prices (below). Real non-zero `cost` always wins.
+[[providers.go.usage]]
+usage_type = "billing"
+windows = [
+    { label = "5h", window_secs = 18000, limit = 12.0 },   # OpenCode Go: $12/5h
+    { label = "7d", window_secs = 604800, limit = 30.0 },  #              $30/week
+    { label = "30d", window_secs = 2592000, limit = 60.0 },#              $60/month
 ]
-# --- model prices (optional): Go reports cost=$0 (subscription), so the bridge
-# estimates spend as tokens × PAYG price to drive the windows above. $/1M tokens.
-# Real non-zero `cost` (non-subscription providers) always wins over the estimate.
-[providers.go.model_prices]
-"deepseek-v4-flash" = { input = 0.14, output = 0.28 }   # published Zen prices
+
+[providers.go.usage.model_prices]   # $/1M tokens — published Zen PAYG rates
+"deepseek-v4-flash" = { input = 0.14, output = 0.28 }
 "kimi-k2.6"         = { input = 0.95, output = 4.00 }
 "kimi-k2.5"         = { input = 0.60, output = 3.00 }
 "glm-5.1"           = { input = 1.40, output = 4.40 }
@@ -88,6 +92,11 @@ cost_windows = [
 "minimax-m2.7"      = { input = 0.30, output = 1.20 }
 "minimax-m2.5"      = { input = 0.30, output = 1.20 }
 "deepseek-v4-pro"   = { input = 0.40, output = 1.60 }   # PLACEHOLDER — not in Zen's published pricing; verify
+
+# count: cap request volume, e.g. 500 requests/day (example — adjust to your plan).
+[[providers.go.usage]]
+usage_type = "count"
+windows = [{ label = "1d", window_secs = 86400, limit = 500.0 }]
 
 # ----------------------------------------------------------------------------
 # Routes map the model name a client sends (alias) to a provider + upstream

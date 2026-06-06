@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use sqlx::sqlite::SqlitePool;
 
 use crate::canonical::{CanonicalEvent, CanonicalRequest};
-use crate::config::{Config, ModelPrice};
+use crate::config::{Config, ModelPrice, UsageKind, UsageSpec};
 use crate::error::BridgeError;
 use crate::router::{self, Resolved};
 use crate::sse::{SseDecoder, SseItem};
@@ -45,35 +45,110 @@ pub struct AppState {
     pub usage_on: AtomicBool,
 }
 
-/// Records the served provider's cost when a (streaming) response finishes. Holds
-/// the served model's price so spend can be estimated when the upstream reports $0.
+/// Records the served provider's usage when a (streaming) response finishes. Holds
+/// the provider's usage kinds + (for billing) the served model's price, so amounts
+/// can be computed at stream end.
 struct CostRecorder {
     meter: Arc<UsageMeter>,
     provider: String,
-    price: Option<ModelPrice>,
+    kinds: Vec<(UsageKind, Option<ModelPrice>)>,
 }
 
-/// Look up the configured PAYG price for a provider's upstream model (for the
-/// token-based estimate when the upstream reports `cost = $0`).
-fn price_for(cfg: &Config, provider: &str, model: &str) -> Option<ModelPrice> {
+/// The provider's usage kinds paired with the served model's billing price (if any) —
+/// everything needed to compute per-kind amounts for one request.
+fn usage_kinds(cfg: &Config, provider: &str, model: &str) -> Vec<(UsageKind, Option<ModelPrice>)> {
     cfg.providers
         .get(provider)
-        .and_then(|p| p.model_prices.get(model))
-        .copied()
+        .map(|p| {
+            p.usage
+                .iter()
+                .map(|spec| {
+                    let price = spec.model_prices().and_then(|m| m.get(model)).copied();
+                    (spec.kind(), price)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-/// Build a stream cost recorder — `None` when tracking is off, so `run_stream`
-/// skips all cost/token capture (zero overhead).
+/// Record one request's amount for each of the provider's usage kinds.
+async fn record_amounts(
+    meter: &UsageMeter,
+    provider: &str,
+    kinds: &[(UsageKind, Option<ModelPrice>)],
+    real: Option<f64>,
+    pt: Option<u64>,
+    ct: Option<u64>,
+) {
+    let now = now_secs();
+    for (kind, price) in kinds {
+        if let Some(amount) = usage::amount_for(*kind, price.as_ref(), real, pt, ct) {
+            meter.record(provider, *kind, amount, now).await;
+        }
+    }
+}
+
+/// Per-provider usage view for `/v1/providers` + admin: one entry per usage spec,
+/// `{usage_type, unit, [model_prices], windows[]}`. When `enabled`, windows carry
+/// live `spent/remaining/reset_in_secs`; otherwise just the config (label/secs/limit).
+pub(crate) fn usage_view(
+    meter: &UsageMeter,
+    provider: &str,
+    specs: &[UsageSpec],
+    now: i64,
+    enabled: bool,
+) -> Vec<Value> {
+    specs
+        .iter()
+        .map(|spec| {
+            let kind = spec.kind();
+            let windows: Vec<Value> = if enabled {
+                let stats = meter.windows(provider, kind, spec.windows(), now);
+                spec.windows()
+                    .iter()
+                    .zip(stats)
+                    .map(|(w, st)| {
+                        json!({
+                            "label": w.label, "window_secs": w.window_secs, "limit": w.limit,
+                            "spent": st.spent, "remaining": st.remaining,
+                            "reset_in_secs": st.reset_in_secs,
+                        })
+                    })
+                    .collect()
+            } else {
+                spec.windows()
+                    .iter()
+                    .map(|w| json!({ "label": w.label, "window_secs": w.window_secs, "limit": w.limit }))
+                    .collect()
+            };
+            let mut obj = json!({ "usage_type": kind.as_str(), "unit": kind.unit(), "windows": windows });
+            if let Some(mp) = spec.model_prices() {
+                obj["model_prices"] = json!(mp);
+            }
+            obj
+        })
+        .collect()
+}
+
+/// Build a stream usage recorder — `None` when tracking is off (so `run_stream`
+/// skips all capture) or the provider has no usage specs.
 fn cost_recorder(
     state: &AppState,
     cfg: &Config,
     provider: String,
     model: &str,
 ) -> Option<CostRecorder> {
-    state.usage_enabled().then(|| CostRecorder {
+    if !state.usage_enabled() {
+        return None;
+    }
+    let kinds = usage_kinds(cfg, &provider, model);
+    if kinds.is_empty() {
+        return None;
+    }
+    Some(CostRecorder {
         meter: state.usage.clone(),
-        price: price_for(cfg, &provider, model),
         provider,
+        kinds,
     })
 }
 
@@ -186,12 +261,6 @@ async fn providers_status(State(state): State<Arc<AppState>>) -> Json<Value> {
                 .and_then(|m| m.get(name))
                 .cloned()
                 .unwrap_or_default();
-            // Hidden entirely when tracking is off (no window computation either).
-            let cost_windows = if enabled {
-                json!(state.usage.windows(name, &p.cost_windows, now))
-            } else {
-                json!([])
-            };
             json!({
                 "name": name,
                 "base_url": p.base_url,
@@ -205,7 +274,7 @@ async fn providers_status(State(state): State<Arc<AppState>>) -> Json<Value> {
                 "last_ok": s.last_ok,
                 "error": s.error,
                 "note": s.note,
-                "cost_windows": cost_windows,
+                "usage": usage_view(&state.usage, name, &p.usage, now, enabled),
             })
         })
         .collect();
@@ -272,13 +341,7 @@ async fn responses_handler(
     } else {
         let (provider, model, upstream_resp) =
             call_upstream_json(&state, &req, &candidates).await?;
-        record_cost(
-            &state,
-            &provider,
-            price_for(&cfg, &provider, &model),
-            &upstream_resp,
-        )
-        .await;
+        record_nonstream(&state, &cfg, &provider, &model, &upstream_resp).await;
         let events = chat::completion_to_events(&upstream_resp, &response_id);
         let mut emitter = responses::ResponsesEmitter::new();
         for ev in &events {
@@ -288,17 +351,25 @@ async fn responses_handler(
     }
 }
 
-/// Record a non-stream response's cost against the served provider — the real
-/// `cost` if non-zero, otherwise a token×price estimate. No-op when tracking is off.
-async fn record_cost(state: &AppState, provider: &str, price: Option<ModelPrice>, resp: &Value) {
+/// Record a non-stream response's usage against the served provider, per kind.
+/// No-op when tracking is off or the provider has no usage specs.
+async fn record_nonstream(
+    state: &AppState,
+    cfg: &Config,
+    provider: &str,
+    model: &str,
+    resp: &Value,
+) {
     if !state.usage_enabled() {
+        return;
+    }
+    let kinds = usage_kinds(cfg, provider, model);
+    if kinds.is_empty() {
         return;
     }
     let real = resp.get("cost").and_then(usage::parse_cost);
     let (pt, ct) = usage::tokens_from_usage(resp.get("usage"));
-    if let Some(c) = usage::effective_cost(real, price.as_ref(), pt, ct) {
-        state.usage.record(provider, c, now_secs()).await;
-    }
+    record_amounts(&state.usage, provider, &kinds, real, pt, ct).await;
 }
 
 /// Drive the upstream Chat Completions stream through the canonical pipeline and
@@ -387,10 +458,8 @@ fn run_stream<E: CanonicalEmitter + Send + 'static>(
             }
         }
 
-        if let Some(r) = &recorder
-            && let Some(c) = usage::effective_cost(cost, r.price.as_ref(), ptok, ctok)
-        {
-            r.meter.record(&r.provider, c, now_secs()).await;
+        if let Some(r) = &recorder {
+            record_amounts(&r.meter, &r.provider, &r.kinds, cost, ptok, ctok).await;
         }
     };
     Sse::new(s)
@@ -544,7 +613,7 @@ async fn chat_handler(
         Ok(resp)
     } else {
         let (provider, model, resp) = call_upstream_json(&state, &req, &candidates).await?;
-        record_cost(&state, &provider, price_for(&cfg, &provider, &model), &resp).await;
+        record_nonstream(&state, &cfg, &provider, &model, &resp).await;
         Ok(Json(resp).into_response())
     }
 }
@@ -598,13 +667,7 @@ async fn messages_handler(
     } else {
         let (provider, model, upstream_resp) =
             call_upstream_json(&state, &req, &candidates).await?;
-        record_cost(
-            &state,
-            &provider,
-            price_for(&cfg, &provider, &model),
-            &upstream_resp,
-        )
-        .await;
+        record_nonstream(&state, &cfg, &provider, &model, &upstream_resp).await;
         let events = chat::completion_to_events(&upstream_resp, &response_id);
         let mut emitter = anthropic::AnthropicEmitter::new();
         for ev in &events {

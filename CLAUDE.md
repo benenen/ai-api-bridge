@@ -95,6 +95,13 @@ wire-format directly:
   `POST /admin/api/usage {"enabled":bool}` toggle it at runtime. When off, the record/exposure/
   usage-failover paths short-circuit at zero overhead; **reactive 429 failover is independent
   and always on** (`is_retryable` in `server.rs`).
+- **Usage is typed** (`config.rs`): `Provider.usage: Vec<UsageSpec>` — a tagged enum
+  (`{usage_type: billing|count|token, windows[], model_prices?}`). The `UsageMeter` keys events
+  by `(provider, UsageKind)`; the rolling-window math (spent/remaining/exhausted) is unit-agnostic
+  and `amount_for` derives each request's amount (billing = real cost or token×price; count = 1;
+  token = prompt+completion). `/v1/providers` + admin expose `usage_view` (per-type, `unit`-tagged);
+  the admin page renders one bar section per type. Legacy `cost_windows`/`model_prices` fold into a
+  `billing` spec at load (`Provider::normalize_usage`), so old configs/DB rows keep working.
 
 ## Conventions / gotchas
 - Wire-format dispatch is plain functions + a sync `CanonicalEmitter` trait (used as a

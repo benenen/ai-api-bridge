@@ -387,12 +387,8 @@
             <input name="probe_interval_secs" inputmode="numeric" placeholder="300" />
           </div>
           <div class="field">
-            <label>Cost windows <span class="opt">(JSON — accumulates each completion's cost; remaining 0 ⇒ fail over)</span></label>
-            <textarea name="cost_windows" spellcheck="false" placeholder='[{ "label": "5h", "window_secs": 18000, "limit": 12 }]'>[]</textarea>
-          </div>
-          <div class="field">
-            <label>Model prices <span class="opt">(JSON, $/1M tokens — estimates spend when upstream cost is $0, e.g. subscriptions)</span></label>
-            <textarea name="model_prices" spellcheck="false" placeholder='{ "deepseek-v4-pro": { "input": 0.4, "output": 1.6 } }'>{}</textarea>
+            <label>Usage <span class="opt">(JSON array of {usage_type: billing|count|token, windows[], model_prices?}; remaining 0 ⇒ fail over)</span></label>
+            <textarea name="usage" spellcheck="false" rows="6" placeholder='[{ "usage_type": "billing", "windows": [{ "label": "5h", "window_secs": 18000, "limit": 12 }], "model_prices": { "deepseek-v4-pro": { "input": 0.4, "output": 1.6 } } }]'>[]</textarea>
           </div>
           <div class="form-err" id="provFormErr"></div>
         </div>
@@ -547,6 +543,12 @@ function ago(ts) {
   if (d < 86400) return Math.floor(d / 3600) + "h ago";
   return Math.floor(d / 86400) + "d ago";
 }
+function fmtUnit(unit, n) {
+  if (unit === "usd") return "$" + fmtNum(n);
+  if (unit === "requests") return Math.round(n) + " req";
+  if (unit === "tokens") return fmtNum(n) + " tok";
+  return fmtNum(n);
+}
 function fmtDur(secs) {
   if (secs == null) return "—";
   secs = Math.max(0, secs);
@@ -598,22 +600,26 @@ function providerCard(p) {
       hasLimit ? el("div", { class: "bar" }, el("span", { class: barCls, style: "width:" + pct + "%" })) : false,
     ));
   }
-  if (state.costTracking && Array.isArray(p.cost_windows) && p.cost_windows.length) {
-    const box = el("div", { class: "cost" }, el("div", { class: "cost-head", text: "COST WINDOWS" }));
-    p.cost_windows.forEach((w) => {
-      const limit = w.limit || 0;
-      const spent = w.spent || 0;
-      const remaining = w.remaining != null ? w.remaining : Math.max(0, limit - spent);
-      const pct = limit > 0 ? Math.max(0, Math.min(100, (spent / limit) * 100)) : 0;
-      const cls = remaining <= 0 ? "down" : remaining < limit * 0.25 ? "low" : "live";
-      box.appendChild(el("div", { class: "cost-row" },
-        el("div", { class: "lbl" },
-          el("span", { class: "cw-label", text: w.label }),
-          el("span", {}, el("b", { text: "$" + fmtNum(spent) }), " / $" + fmtNum(limit)),
-          el("span", { class: "cw-reset", text: remaining <= 0 ? "exhausted · +" + fmtDur(w.reset_in_secs) : "$" + fmtNum(remaining) + " left" }),
-        ),
-        el("div", { class: "bar" }, el("span", { class: cls, style: "width:" + pct + "%" })),
-      ));
+  if (state.costTracking && Array.isArray(p.usage) && p.usage.length) {
+    const box = el("div", { class: "cost" });
+    p.usage.forEach((u) => {
+      const unit = u.unit || "usd";
+      box.appendChild(el("div", { class: "cost-head", text: (u.usage_type || "usage").toUpperCase() + " · " + unit }));
+      (u.windows || []).forEach((w) => {
+        const limit = w.limit || 0;
+        const spent = w.spent || 0;
+        const remaining = w.remaining != null ? w.remaining : Math.max(0, limit - spent);
+        const pct = limit > 0 ? Math.max(0, Math.min(100, (spent / limit) * 100)) : 0;
+        const cls = remaining <= 0 ? "down" : remaining < limit * 0.25 ? "low" : "live";
+        box.appendChild(el("div", { class: "cost-row" },
+          el("div", { class: "lbl" },
+            el("span", { class: "cw-label", text: w.label }),
+            el("span", {}, el("b", { text: fmtUnit(unit, spent) }), " / " + fmtUnit(unit, limit)),
+            el("span", { class: "cw-reset", text: remaining <= 0 ? "exhausted · +" + fmtDur(w.reset_in_secs) : fmtUnit(unit, remaining) + " left" }),
+          ),
+          el("div", { class: "bar" }, el("span", { class: cls, style: "width:" + pct + "%" })),
+        ));
+      });
     });
     card.appendChild(box);
   }
@@ -731,12 +737,18 @@ function openProviderModal(name) {
     f.probe_script.value = p.probe_script || "";
     f.probe_enabled.value = p.probe_enabled_override === true ? "on" : p.probe_enabled_override === false ? "off" : "auto";
     f.probe_interval_secs.value = p.probe_interval_secs != null ? p.probe_interval_secs : "";
-    // only the config fields are editable; drop the runtime spent/remaining stats
-    f.cost_windows.value = JSON.stringify(
-      (p.cost_windows || []).map((w) => ({ label: w.label, window_secs: w.window_secs, limit: w.limit })),
+    // reconstruct the editable usage specs — drop runtime spent/remaining/reset/unit
+    f.usage.value = JSON.stringify(
+      (p.usage || []).map((u) => {
+        const spec = {
+          usage_type: u.usage_type,
+          windows: (u.windows || []).map((w) => ({ label: w.label, window_secs: w.window_secs, limit: w.limit })),
+        };
+        if (u.model_prices) spec.model_prices = u.model_prices;
+        return spec;
+      }),
       null, 2,
     );
-    f.model_prices.value = JSON.stringify(p.model_prices || {}, null, 2);
   } else {
     f.api_key.placeholder = "sk-…";
     f.max_tokens_field.placeholder = "max_tokens";
@@ -755,10 +767,8 @@ $("#providerForm").addEventListener("submit", async (e) => {
   const mtf = f.max_tokens_field.value.trim(); if (mtf) p.max_tokens_field = mtf;
   try { p.extra_headers = f.extra_headers.value.trim() ? JSON.parse(f.extra_headers.value) : {}; }
   catch (_) { errEl.textContent = "Extra headers must be valid JSON."; errEl.classList.add("show"); return; }
-  try { p.cost_windows = f.cost_windows.value.trim() ? JSON.parse(f.cost_windows.value) : []; }
-  catch (_) { errEl.textContent = "Cost windows must be valid JSON (array)."; errEl.classList.add("show"); return; }
-  try { p.model_prices = f.model_prices.value.trim() ? JSON.parse(f.model_prices.value) : {}; }
-  catch (_) { errEl.textContent = "Model prices must be valid JSON (object)."; errEl.classList.add("show"); return; }
+  try { p.usage = f.usage.value.trim() ? JSON.parse(f.usage.value) : []; }
+  catch (_) { errEl.textContent = "Usage must be valid JSON (array of typed specs)."; errEl.classList.add("show"); return; }
   const ps = f.probe_script.value.trim(); if (ps) p.probe_script = ps;
   if (f.probe_enabled.value === "on") p.probe_enabled = true;
   else if (f.probe_enabled.value === "off") p.probe_enabled = false;

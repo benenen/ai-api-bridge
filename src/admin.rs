@@ -15,7 +15,7 @@ use axum::response::Html;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::{CostWindow, ModelPrice, Provider, Route, RouteTarget, WireName};
+use crate::config::{CostWindow, ModelPrice, Provider, Route, RouteTarget, UsageSpec, WireName};
 use crate::error::BridgeError;
 use crate::server::{AppState, check_auth, now_secs, reload_from_db};
 use crate::store;
@@ -69,6 +69,8 @@ pub struct ProviderInput {
     pub cost_windows: Vec<CostWindow>,
     #[serde(default)]
     pub model_prices: HashMap<String, ModelPrice>,
+    #[serde(default)]
+    pub usage: Vec<UsageSpec>,
 }
 
 /// Drop empty strings to `None` so blank form fields don't persist as `Some("")`.
@@ -91,7 +93,7 @@ impl ProviderInput {
             return Err(BridgeError::BadRequest("base_url is required".into()));
         }
         let api_key = non_empty(self.api_key).or(existing_api_key);
-        Ok(Provider {
+        let mut provider = Provider {
             wire,
             base_url,
             api_key,
@@ -105,7 +107,11 @@ impl ProviderInput {
             quota_min: self.quota_min,
             cost_windows: self.cost_windows,
             model_prices: self.model_prices,
-        })
+            usage: self.usage,
+        };
+        // Fold legacy cost_windows/model_prices into `usage` if the form sent them.
+        provider.normalize_usage();
+        Ok(provider)
     }
 }
 
@@ -130,38 +136,9 @@ pub async fn list_providers(
                 .and_then(|m| m.get(name))
                 .cloned()
                 .unwrap_or_default();
-            // Merge each window's config (label/window_secs/limit — for the edit form)
-            // with its live spend (spent/remaining/reset_in_secs — for the bars). The
-            // spend stats are only computed when tracking is on.
-            let cost_windows: Vec<Value> = if enabled {
-                let stats = state.usage.windows(name, &p.cost_windows, now);
-                p.cost_windows
-                    .iter()
-                    .zip(stats)
-                    .map(|(w, st)| {
-                        json!({
-                            "label": w.label,
-                            "window_secs": w.window_secs,
-                            "limit": w.limit,
-                            "spent": st.spent,
-                            "remaining": st.remaining,
-                            "reset_in_secs": st.reset_in_secs,
-                        })
-                    })
-                    .collect()
-            } else {
-                // tracking off: still show the configured windows (for editing), no spend.
-                p.cost_windows
-                    .iter()
-                    .map(|w| {
-                        json!({
-                            "label": w.label,
-                            "window_secs": w.window_secs,
-                            "limit": w.limit,
-                        })
-                    })
-                    .collect()
-            };
+            // Typed usage view: per-spec {usage_type, unit, model_prices?, windows[]}
+            // — config for the edit form + live spend for the bars (when tracking on).
+            let usage = crate::server::usage_view(&state.usage, name, &p.usage, now, enabled);
             json!({
                 "name": name,
                 "wire": p.wire.as_str(),
@@ -175,8 +152,7 @@ pub async fn list_providers(
                 "probe_enabled_override": p.probe_enabled,
                 "probe_interval_secs": p.probe_interval_secs,
                 "quota_min": p.quota_min,
-                "cost_windows": cost_windows,
-                "model_prices": p.model_prices,
+                "usage": usage,
                 "status": {
                     "available": s.available,
                     "quota_remaining": s.quota_remaining,

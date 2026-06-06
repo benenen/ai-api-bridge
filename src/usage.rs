@@ -1,10 +1,13 @@
-//! Cost accumulator: per-provider rolling spend windows.
+//! Usage accumulator: per-provider rolling limit windows, by usage *kind*.
 //!
-//! Some providers (notably OpenCode Zen's Go plan) expose no usage API — only a
-//! per-request `cost` field on each completion. The bridge sums that into rolling
-//! windows (Go: $12/5h, $30/7d, $60/30d) so it can show "remaining" and fail over
-//! *before* a window is exhausted. The in-memory event log is authoritative for
-//! reads (status + failover); SQLite persists it across restarts.
+//! A provider can be metered in several "currencies" — billing ($), request count,
+//! tokens — each as rolling windows. Events carry a [`UsageKind`] + an `amount` in
+//! that kind's unit; the window math (`spent = Σ amount`, `remaining = limit −
+//! spent`, `exhausted = remaining ≤ 0`) is identical across kinds. The in-memory
+//! log is authoritative for reads (status + failover); SQLite persists it.
+//!
+//! Some providers (e.g. OpenCode Zen Go) report `cost = $0` (subscription), so for
+//! billing the amount falls back to a token × price estimate (see [`amount_for`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -12,14 +15,14 @@ use std::sync::Mutex;
 use serde_json::Value;
 use sqlx::sqlite::SqlitePool;
 
-use crate::config::{CostWindow, ModelPrice, Provider};
+use crate::config::{ModelPrice, Provider, UsageKind, UsageSpec, UsageWindow};
 use crate::store;
 
 /// Retention horizon: events older than this are dropped (≥ the largest standard
 /// window of 30d, with a day of slack).
 const RETAIN_SECS: i64 = 31 * 24 * 3600;
 
-/// Per-window spend snapshot (exposed at `/v1/providers` + the admin page).
+/// Per-window usage snapshot (exposed at `/v1/providers` + the admin page).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WindowStat {
     pub label: String,
@@ -30,10 +33,12 @@ pub struct WindowStat {
     pub reset_in_secs: i64,
 }
 
-/// In-memory rolling spend log per provider, persisted to SQLite.
+/// Per-kind event log for one provider: kind -> (ts_secs, amount), ascending by ts.
+type ProviderEvents = HashMap<UsageKind, Vec<(i64, f64)>>;
+
+/// In-memory rolling usage log per (provider, kind), persisted to SQLite.
 pub struct UsageMeter {
-    /// provider -> (ts_secs, cost), kept ascending by ts.
-    events: Mutex<HashMap<String, Vec<(i64, f64)>>>,
+    events: Mutex<HashMap<String, ProviderEvents>>,
     pool: Option<SqlitePool>,
 }
 
@@ -45,41 +50,62 @@ impl UsageMeter {
         }
     }
 
-    /// Seed the in-memory log from persisted events (call once at startup).
-    pub fn load(&self, events: Vec<(String, i64, f64)>) {
+    /// Seed the in-memory log from persisted events `(provider, ts, usage_type,
+    /// amount)` (call once at startup). Unknown kinds are skipped.
+    pub fn load(&self, events: Vec<(String, i64, String, f64)>) {
         let mut map = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        for (provider, ts, cost) in events {
-            map.entry(provider).or_default().push((ts, cost));
+        for (provider, ts, kind, amount) in events {
+            let Some(kind) = UsageKind::parse(&kind) else {
+                continue;
+            };
+            map.entry(provider)
+                .or_default()
+                .entry(kind)
+                .or_default()
+                .push((ts, amount));
         }
-        for v in map.values_mut() {
-            v.sort_by_key(|(ts, _)| *ts);
+        for km in map.values_mut() {
+            for v in km.values_mut() {
+                v.sort_by_key(|(ts, _)| *ts);
+            }
         }
     }
 
-    /// Record one request's cost. Zero/negative/non-finite costs are ignored (a
-    /// $0 cached request consumes no budget). Updates memory, then persists.
-    pub async fn record(&self, provider: &str, cost: f64, now: i64) {
-        if !cost.is_finite() || cost <= 0.0 {
+    /// Record one request's usage `amount` for a kind. Zero/negative/non-finite
+    /// amounts are ignored. Updates memory, then persists.
+    pub async fn record(&self, provider: &str, kind: UsageKind, amount: f64, now: i64) {
+        if !amount.is_finite() || amount <= 0.0 {
             return;
         }
         {
             let mut map = self.events.lock().unwrap_or_else(|e| e.into_inner());
-            let v = map.entry(provider.to_string()).or_default();
-            v.push((now, cost));
+            let v = map
+                .entry(provider.to_string())
+                .or_default()
+                .entry(kind)
+                .or_default();
+            v.push((now, amount));
             let cutoff = now - RETAIN_SECS;
             v.retain(|(ts, _)| *ts >= cutoff);
         }
         if let Some(pool) = &self.pool
-            && let Err(e) = store::insert_usage_event(pool, provider, now, cost).await
+            && let Err(e) =
+                store::insert_usage_event(pool, provider, now, kind.as_str(), amount).await
         {
             tracing::warn!(provider, "failed to persist usage event: {e}");
         }
     }
 
-    /// Per-window spend/remaining for a provider at time `now`.
-    pub fn windows(&self, provider: &str, windows: &[CostWindow], now: i64) -> Vec<WindowStat> {
+    /// Per-window spent/remaining for a provider's kind at time `now`.
+    pub fn windows(
+        &self,
+        provider: &str,
+        kind: UsageKind,
+        windows: &[UsageWindow],
+        now: i64,
+    ) -> Vec<WindowStat> {
         let map = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        let events = map.get(provider);
+        let events = map.get(provider).and_then(|km| km.get(&kind));
         windows
             .iter()
             .map(|w| {
@@ -87,9 +113,9 @@ impl UsageMeter {
                 let mut spent = 0.0f64;
                 let mut oldest: Option<i64> = None;
                 if let Some(evts) = events {
-                    for (ts, cost) in evts {
+                    for (ts, amount) in evts {
                         if *ts > cutoff {
-                            spent += *cost;
+                            spent += *amount;
                             if oldest.is_none() {
                                 oldest = Some(*ts); // ascending -> first in-window is oldest
                             }
@@ -112,13 +138,14 @@ impl UsageMeter {
             .collect()
     }
 
-    /// Whether any configured window is exhausted (`remaining <= 0`) — for failover.
-    pub fn exhausted(&self, provider: &str, windows: &[CostWindow], now: i64) -> bool {
-        !windows.is_empty()
-            && self
-                .windows(provider, windows, now)
+    /// Whether any window of any of the provider's usage specs is exhausted
+    /// (`remaining <= 0`, in any unit) — for failover.
+    pub fn exhausted(&self, provider: &str, specs: &[UsageSpec], now: i64) -> bool {
+        specs.iter().any(|spec| {
+            self.windows(provider, spec.kind(), spec.windows(), now)
                 .iter()
                 .any(|w| w.remaining <= 0.0)
+        })
     }
 
     /// The set of providers with at least one exhausted window — passed to the
@@ -130,9 +157,27 @@ impl UsageMeter {
     ) -> HashSet<String> {
         providers
             .iter()
-            .filter(|(name, p)| self.exhausted(name, &p.cost_windows, now))
+            .filter(|(name, p)| self.exhausted(name, &p.usage, now))
             .map(|(name, _)| name.clone())
             .collect()
+    }
+}
+
+/// The amount to charge a kind for one request: billing → real cost or token×price
+/// estimate; count → 1; token → prompt + completion tokens.
+pub fn amount_for(
+    kind: UsageKind,
+    price: Option<&ModelPrice>,
+    real: Option<f64>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+) -> Option<f64> {
+    match kind {
+        UsageKind::Billing => effective_cost(real, price, prompt_tokens, completion_tokens),
+        UsageKind::Count => Some(1.0),
+        UsageKind::Token => {
+            Some((prompt_tokens.unwrap_or(0) + completion_tokens.unwrap_or(0)) as f64)
+        }
     }
 }
 
@@ -178,11 +223,19 @@ pub fn effective_cost(
 mod tests {
     use super::*;
 
-    fn w(label: &str, secs: u64, limit: f64) -> CostWindow {
-        CostWindow {
+    use UsageKind::{Billing, Count, Token};
+
+    fn w(label: &str, secs: u64, limit: f64) -> UsageWindow {
+        UsageWindow {
             label: label.into(),
             window_secs: secs,
             limit,
+        }
+    }
+    fn billing(windows: Vec<UsageWindow>) -> UsageSpec {
+        UsageSpec::Billing {
+            windows,
+            model_prices: HashMap::new(),
         }
     }
 
@@ -190,11 +243,11 @@ mod tests {
     async fn windows_sum_within_horizon() {
         let m = UsageMeter::new(None);
         let now = 1_000_000i64;
-        m.record("go", 3.0, now - 100).await; // in 5h
-        m.record("go", 4.0, now - 10_000).await; // in 5h
-        m.record("go", 5.0, now - 20_000).await; // outside 5h (18000), inside 7d
+        m.record("go", Billing, 3.0, now - 100).await; // in 5h
+        m.record("go", Billing, 4.0, now - 10_000).await; // in 5h
+        m.record("go", Billing, 5.0, now - 20_000).await; // outside 5h, inside 7d
         let win = vec![w("5h", 18000, 12.0), w("7d", 604800, 30.0)];
-        let stats = m.windows("go", &win, now);
+        let stats = m.windows("go", Billing, &win, now);
         assert_eq!(stats[0].label, "5h");
         assert_eq!(stats[0].spent, 7.0);
         assert_eq!(stats[0].remaining, 5.0);
@@ -203,42 +256,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_when_over_limit() {
+    async fn kinds_are_independent() {
         let m = UsageMeter::new(None);
         let now = 1_000i64;
-        let win = vec![w("5h", 18000, 12.0)];
-        assert!(!m.exhausted("go", &win, now));
-        m.record("go", 12.5, now).await;
-        assert!(m.exhausted("go", &win, now));
-        assert!(!m.exhausted("zen", &win, now)); // unknown provider
-        assert!(!m.exhausted("go", &[], now)); // no windows configured
+        m.record("go", Billing, 2.0, now).await;
+        m.record("go", Count, 1.0, now).await;
+        m.record("go", Count, 1.0, now).await;
+        m.record("go", Token, 500.0, now).await;
+        let win = vec![w("5h", 18000, 9999.0)];
+        assert_eq!(m.windows("go", Billing, &win, now)[0].spent, 2.0);
+        assert_eq!(m.windows("go", Count, &win, now)[0].spent, 2.0);
+        assert_eq!(m.windows("go", Token, &win, now)[0].spent, 500.0);
     }
 
     #[tokio::test]
-    async fn zero_cost_is_ignored() {
+    async fn exhausted_across_mixed_kinds() {
         let m = UsageMeter::new(None);
-        m.record("go", 0.0, 100).await;
-        m.record("go", -1.0, 100).await;
-        let stats = m.windows("go", &[w("5h", 18000, 12.0)], 100);
-        assert_eq!(stats[0].spent, 0.0);
+        let now = 1_000i64;
+        let specs = vec![
+            billing(vec![w("5h", 18000, 10.0)]),
+            UsageSpec::Count {
+                windows: vec![w("1d", 86400, 3.0)],
+            },
+        ];
+        assert!(!m.exhausted("go", &specs, now));
+        for _ in 0..3 {
+            m.record("go", Count, 1.0, now).await; // fill the count window only
+        }
+        assert!(m.exhausted("go", &specs, now));
+        assert!(!m.exhausted("go", &[], now)); // no specs
+    }
+
+    #[tokio::test]
+    async fn zero_amount_is_ignored() {
+        let m = UsageMeter::new(None);
+        m.record("go", Billing, 0.0, 100).await;
+        m.record("go", Billing, -1.0, 100).await;
+        assert_eq!(
+            m.windows("go", Billing, &[w("5h", 18000, 12.0)], 100)[0].spent,
+            0.0
+        );
     }
 
     #[tokio::test]
     async fn reset_in_secs_tracks_oldest_in_window() {
         let m = UsageMeter::new(None);
         let now = 100_000i64;
-        m.record("go", 1.0, now - 1000).await; // oldest
-        m.record("go", 1.0, now - 500).await;
-        let stats = m.windows("go", &[w("5h", 18000, 12.0)], now);
+        m.record("go", Billing, 1.0, now - 1000).await; // oldest
+        m.record("go", Billing, 1.0, now - 500).await;
+        let stats = m.windows("go", Billing, &[w("5h", 18000, 12.0)], now);
         assert_eq!(stats[0].reset_in_secs, 17000); // (now-1000)+18000 - now
     }
 
     #[tokio::test]
     async fn load_seeds_events() {
         let m = UsageMeter::new(None);
-        m.load(vec![("go".into(), 100, 2.0), ("go".into(), 200, 3.0)]);
-        let stats = m.windows("go", &[w("5h", 18000, 12.0)], 210);
-        assert_eq!(stats[0].spent, 5.0);
+        m.load(vec![
+            ("go".into(), 100, "billing".into(), 2.0),
+            ("go".into(), 200, "billing".into(), 3.0),
+            ("go".into(), 200, "count".into(), 1.0),
+        ]);
+        assert_eq!(
+            m.windows("go", Billing, &[w("5h", 18000, 12.0)], 210)[0].spent,
+            5.0
+        );
+        assert_eq!(
+            m.windows("go", Count, &[w("5h", 18000, 12.0)], 210)[0].spent,
+            1.0
+        );
+    }
+
+    #[test]
+    fn amount_for_by_kind() {
+        let p = ModelPrice {
+            input: 0.4,
+            output: 1.6,
+        };
+        // billing: $0 real -> token estimate; real>0 wins
+        assert_eq!(
+            amount_for(Billing, Some(&p), Some(0.0), Some(1_000_000), Some(0)),
+            Some(0.4)
+        );
+        assert_eq!(
+            amount_for(Billing, Some(&p), Some(0.5), Some(9), Some(9)),
+            Some(0.5)
+        );
+        // count: always 1; token: prompt + completion
+        assert_eq!(
+            amount_for(Count, None, Some(0.0), Some(9), Some(9)),
+            Some(1.0)
+        );
+        assert_eq!(
+            amount_for(Token, None, None, Some(92), Some(200)),
+            Some(292.0)
+        );
     }
 
     #[test]
