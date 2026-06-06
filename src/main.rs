@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use ai_api_bridge::config::Config;
 use ai_api_bridge::server::{AppState, build_app};
@@ -75,13 +75,18 @@ async fn main() -> anyhow::Result<()> {
     let status: watcher::StatusMap = Arc::new(RwLock::new(
         store::load_statuses(&pool).await.unwrap_or_default(),
     ));
-    watcher::spawn(pool.clone(), &config.providers, status.clone());
+    let watchers = Mutex::new(watcher::spawn(
+        pool.clone(),
+        &config.providers,
+        status.clone(),
+    ));
 
     let state = Arc::new(AppState {
-        config,
+        config: RwLock::new(Arc::new(config)),
         upstream: Upstream::new(),
         status,
         pool: Some(pool),
+        watchers,
     });
     let app = build_app(state);
 

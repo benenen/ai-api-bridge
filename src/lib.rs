@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod canonical;
 pub mod config;
 pub mod error;

@@ -1,6 +1,6 @@
 //! End-to-end: Codex-shaped Responses request -> bridge -> mock Zen upstream -> Responses SSE.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::Router;
 use axum::http::StatusCode;
@@ -91,10 +91,11 @@ model_prefix = "opencode/"
     ))
     .unwrap();
     let bridge_url = spawn(build_app(Arc::new(AppState {
-        config: cfg,
+        config: RwLock::new(Arc::new(cfg)),
         upstream: Upstream::new(),
         status: Default::default(),
         pool: None,
+        watchers: Default::default(),
     })))
     .await;
 
@@ -123,10 +124,11 @@ async fn inband_upstream_error_becomes_response_failed() {
     ))
     .unwrap();
     let bridge_url = spawn(build_app(Arc::new(AppState {
-        config: cfg,
+        config: RwLock::new(Arc::new(cfg)),
         upstream: Upstream::new(),
         status: Default::default(),
         pool: None,
+        watchers: Default::default(),
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -150,10 +152,11 @@ async fn unknown_model_returns_400() {
         Config::from_toml("[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"http://127.0.0.1:1\"")
             .unwrap();
     let bridge_url = spawn(build_app(Arc::new(AppState {
-        config: cfg,
+        config: RwLock::new(Arc::new(cfg)),
         upstream: Upstream::new(),
         status: Default::default(),
         pool: None,
+        watchers: Default::default(),
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -172,10 +175,11 @@ async fn lists_models() {
     )
     .unwrap();
     let url = spawn(build_app(Arc::new(AppState {
-        config: cfg,
+        config: RwLock::new(Arc::new(cfg)),
         upstream: Upstream::new(),
         status: Default::default(),
         pool: None,
+        watchers: Default::default(),
     })))
     .await;
     let body: serde_json::Value = reqwest::get(format!("{url}/v1/models"))
@@ -206,10 +210,11 @@ async fn messages_streaming_end_to_end() {
     let upstream_url = spawn(Router::new().route("/chat/completions", post(mock_chat))).await;
     let cfg = messages_bridge_url_for(&upstream_url);
     let bridge_url = spawn(build_app(Arc::new(AppState {
-        config: cfg,
+        config: RwLock::new(Arc::new(cfg)),
         upstream: Upstream::new(),
         status: Default::default(),
         pool: None,
+        watchers: Default::default(),
     })))
     .await;
 
@@ -241,10 +246,11 @@ async fn messages_non_streaming_end_to_end() {
     let upstream_url = spawn(Router::new().route("/chat/completions", post(mock_chat_json))).await;
     let cfg = messages_bridge_url_for(&upstream_url);
     let bridge_url = spawn(build_app(Arc::new(AppState {
-        config: cfg,
+        config: RwLock::new(Arc::new(cfg)),
         upstream: Upstream::new(),
         status: Default::default(),
         pool: None,
+        watchers: Default::default(),
     })))
     .await;
 
@@ -273,10 +279,11 @@ async fn messages_tool_use_streaming() {
     let upstream_url = spawn(Router::new().route("/chat/completions", post(mock_chat_tool))).await;
     let cfg = messages_bridge_url_for(&upstream_url);
     let bridge_url = spawn(build_app(Arc::new(AppState {
-        config: cfg,
+        config: RwLock::new(Arc::new(cfg)),
         upstream: Upstream::new(),
         status: Default::default(),
         pool: None,
+        watchers: Default::default(),
     })))
     .await;
 
@@ -303,10 +310,11 @@ async fn messages_tool_use_streaming() {
 async fn messages_missing_model_returns_400() {
     let cfg = Config::from_toml("[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"u\"").unwrap();
     let url = spawn(build_app(Arc::new(AppState {
-        config: cfg,
+        config: RwLock::new(Arc::new(cfg)),
         upstream: Upstream::new(),
         status: Default::default(),
         pool: None,
+        watchers: Default::default(),
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -334,10 +342,11 @@ fn failover_cfg(bad: &str, good: &str) -> Config {
 
 fn app(cfg: Config) -> Router {
     build_app(Arc::new(AppState {
-        config: cfg,
+        config: RwLock::new(Arc::new(cfg)),
         upstream: Upstream::new(),
         status: Default::default(),
         pool: None,
+        watchers: Default::default(),
     }))
 }
 

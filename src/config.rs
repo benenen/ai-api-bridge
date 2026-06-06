@@ -77,6 +77,27 @@ pub enum WireName {
     AnthropicMessages,
 }
 
+impl WireName {
+    /// The kebab-case wire string used in config, the DB, and the admin API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WireName::OpenaiChat => "openai-chat",
+            WireName::OpenaiResponses => "openai-responses",
+            WireName::AnthropicMessages => "anthropic-messages",
+        }
+    }
+
+    /// Parse the kebab-case wire string (the inverse of [`WireName::as_str`]).
+    pub fn parse(s: &str) -> Option<WireName> {
+        match s {
+            "openai-chat" => Some(WireName::OpenaiChat),
+            "openai-responses" => Some(WireName::OpenaiResponses),
+            "anthropic-messages" => Some(WireName::AnthropicMessages),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Route {
     pub alias: String,

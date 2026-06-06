@@ -1,7 +1,7 @@
 //! axum app + handlers + the streaming translation pipeline.
 
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_stream::stream;
 use axum::body::Body;
@@ -9,7 +9,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
@@ -21,19 +21,65 @@ use crate::error::BridgeError;
 use crate::router::{self, Resolved};
 use crate::sse::{SseDecoder, SseItem};
 use crate::upstream::{ByteStream, Upstream};
-use crate::watcher::StatusMap;
+use crate::watcher::{self, StatusMap, WatcherHandles};
 use crate::wire::{CanonicalEmitter, anthropic, chat, responses};
 use crate::{probe, store};
 
 pub struct AppState {
-    pub config: Config,
+    /// The live provider/route config. Wrapped in `RwLock<Arc<_>>` so admin CRUD
+    /// can hot-swap it: handlers take a cheap `Arc` snapshot at entry (dropping the
+    /// guard before any `.await`), so `Resolved<'a>` never borrows across a lock.
+    pub config: RwLock<Arc<Config>>,
     pub upstream: Upstream,
     pub status: StatusMap,
-    /// Live DB handle for reactive re-probes (None in tests).
+    /// Live DB handle for reactive re-probes + admin writes (None in tests).
     pub pool: Option<SqlitePool>,
+    /// Running probe-task handles, aborted + respawned on a provider change.
+    pub watchers: WatcherHandles,
+}
+
+impl AppState {
+    /// Cheap snapshot of the current config (clones an `Arc`, not the `Config`).
+    pub fn config(&self) -> Arc<Config> {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+/// Rebuild the live config from the DB and re-sync the runtime after an admin
+/// provider/route write: reload providers+routes, swap the config snapshot,
+/// restart the probe tasks (so the watcher tracks added/edited/removed providers),
+/// and drop status entries for providers that no longer exist.
+pub(crate) async fn reload_from_db(state: &AppState) -> Result<(), BridgeError> {
+    let Some(pool) = &state.pool else {
+        return Err(BridgeError::Internal("no database handle".into()));
+    };
+    // Keep process-level fields (listen/database/default_provider/auth_token) from
+    // the current snapshot; only providers + routes are reloaded from the DB.
+    let mut cfg = (*state.config()).clone();
+    store::load_into_config(pool, &mut cfg)
+        .await
+        .map_err(|e| BridgeError::Internal(format!("reload from db: {e}")))?;
+    cfg.apply_env_overrides();
+    let providers = cfg.providers.clone();
+
+    *state.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(cfg);
+    watcher::reconcile(
+        &state.watchers,
+        pool.clone(),
+        &providers,
+        state.status.clone(),
+    );
+    if let Ok(mut m) = state.status.write() {
+        m.retain(|name, _| providers.contains_key(name));
+    }
+    Ok(())
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
+    use crate::admin;
     Router::new()
         .route("/health", get(health))
         .route("/v1/responses", post(responses_handler))
@@ -41,14 +87,33 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/messages", post(messages_handler))
         .route("/v1/providers", get(providers_status))
+        // Admin: management page + provider/route CRUD (reuses `auth_token`).
+        .route("/", get(admin::page))
+        .route("/admin", get(admin::page))
+        .route(
+            "/admin/api/providers",
+            get(admin::list_providers).post(admin::create_provider),
+        )
+        .route(
+            "/admin/api/providers/:name",
+            put(admin::update_provider).delete(admin::delete_provider),
+        )
+        .route(
+            "/admin/api/routes",
+            get(admin::list_routes).post(admin::create_route),
+        )
+        .route(
+            "/admin/api/routes/:alias",
+            put(admin::update_route).delete(admin::delete_route),
+        )
         .with_state(state)
 }
 
 /// Watcher view of each provider: availability + quota + last-check info.
 async fn providers_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let cfg = state.config();
     let status = state.status.read().ok();
-    let mut providers: Vec<Value> = state
-        .config
+    let mut providers: Vec<Value> = cfg
         .providers
         .iter()
         .map(|(name, p)| {
@@ -81,8 +146,8 @@ async fn health() -> &'static str {
     "ok"
 }
 
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), BridgeError> {
-    let Some(expected) = &state.config.auth_token else {
+pub(crate) fn check_auth(cfg: &Config, headers: &HeaderMap) -> Result<(), BridgeError> {
+    let Some(expected) = &cfg.auth_token else {
         return Ok(());
     };
     let bearer = headers
@@ -105,13 +170,14 @@ async fn responses_handler(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, BridgeError> {
-    check_auth(&state, &headers)?;
+    let cfg = state.config();
+    check_auth(&cfg, &headers)?;
 
     let req = responses::parse_request(&body)?;
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let candidates = {
         let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        router::resolve_candidates(&state.config, &status, &req.model)?
+        router::resolve_candidates(&cfg, &status, &req.model)?
     };
     tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, "responses request");
 
@@ -308,11 +374,12 @@ async fn chat_handler(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, BridgeError> {
-    check_auth(&state, &headers)?;
+    let cfg = state.config();
+    check_auth(&cfg, &headers)?;
     let req = chat::parse_request(&body)?;
     let candidates = {
         let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        router::resolve_candidates(&state.config, &status, &req.model)?
+        router::resolve_candidates(&cfg, &status, &req.model)?
     };
 
     if req.stream {
@@ -329,8 +396,8 @@ async fn chat_handler(
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let data: Vec<Value> = state
-        .config
+    let cfg = state.config();
+    let data: Vec<Value> = cfg
         .routes
         .iter()
         .map(|r| json!({"id": r.alias, "object": "model", "owned_by": r.provider}))
@@ -346,13 +413,14 @@ async fn messages_handler(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, BridgeError> {
-    check_auth(&state, &headers)?;
+    let cfg = state.config();
+    check_auth(&cfg, &headers)?;
 
     let req = anthropic::parse_request(&body)?;
     let response_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let candidates = {
         let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        router::resolve_candidates(&state.config, &status, &req.model)?
+        router::resolve_candidates(&cfg, &status, &req.model)?
     };
     tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, "messages request");
 

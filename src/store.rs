@@ -14,7 +14,10 @@ use crate::config::{Config, Provider, Route, WireName};
 pub async fn open(path: &str) -> anyhow::Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(path)
-        .create_if_missing(true);
+        .create_if_missing(true)
+        // Enforce `routes.provider`/`provider_status.provider` FKs so deleting a
+        // provider cascades to its routes + status row (admin delete relies on this).
+        .foreign_keys(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(opts)
@@ -90,23 +93,7 @@ pub async fn load_into_config(pool: &SqlitePool, cfg: &mut Config) -> anyhow::Re
     .await?;
     let mut providers = HashMap::with_capacity(prows.len());
     for r in prows {
-        let extra_headers: HashMap<String, String> =
-            serde_json::from_str(&r.extra_headers).unwrap_or_default();
-        providers.insert(
-            r.name,
-            Provider {
-                wire: str_to_wire(&r.wire)?,
-                base_url: r.base_url,
-                api_key: r.api_key,
-                model_prefix: r.model_prefix,
-                max_tokens_field: r.max_tokens_field,
-                extra_headers,
-                probe_script: r.probe_script,
-                probe_enabled: r.probe_enabled.map(|b| b != 0),
-                probe_interval_secs: r.probe_interval_secs.map(|s| s as u64),
-                quota_min: r.quota_min,
-            },
-        );
+        providers.insert(r.name.clone(), row_to_provider(r)?);
     }
 
     let rrows: Vec<RouteRow> =
@@ -126,6 +113,133 @@ pub async fn load_into_config(pool: &SqlitePool, cfg: &mut Config) -> anyhow::Re
     cfg.providers = providers;
     cfg.routes = routes;
     Ok(())
+}
+
+fn row_to_provider(r: ProviderRow) -> anyhow::Result<Provider> {
+    let extra_headers: HashMap<String, String> =
+        serde_json::from_str(&r.extra_headers).unwrap_or_default();
+    Ok(Provider {
+        wire: str_to_wire(&r.wire)?,
+        base_url: r.base_url,
+        api_key: r.api_key,
+        model_prefix: r.model_prefix,
+        max_tokens_field: r.max_tokens_field,
+        extra_headers,
+        probe_script: r.probe_script,
+        probe_enabled: r.probe_enabled.map(|b| b != 0),
+        probe_interval_secs: r.probe_interval_secs.map(|s| s as u64),
+        quota_min: r.quota_min,
+    })
+}
+
+const PROVIDER_COLS: &str = "name, wire, base_url, api_key, model_prefix, max_tokens_field, \
+     extra_headers, probe_script, probe_enabled, probe_interval_secs, quota_min";
+
+/// Fetch one provider by name (used by the admin update path to read the stored
+/// `api_key` when the form leaves it blank).
+pub async fn get_provider(pool: &SqlitePool, name: &str) -> anyhow::Result<Option<Provider>> {
+    let row: Option<ProviderRow> = sqlx::query_as(&format!(
+        "SELECT {PROVIDER_COLS} FROM providers WHERE name = ?"
+    ))
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    row.map(row_to_provider).transpose()
+}
+
+/// Insert a new provider. Errors (UNIQUE violation) if `name` already exists —
+/// callers check `get_provider` first to return a clean 409.
+pub async fn insert_provider(pool: &SqlitePool, name: &str, p: &Provider) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO providers \
+         (name, wire, base_url, api_key, model_prefix, max_tokens_field, extra_headers, \
+          probe_script, probe_enabled, probe_interval_secs, quota_min) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(name)
+    .bind(wire_to_str(p.wire))
+    .bind(p.base_url.as_str())
+    .bind(p.api_key.as_deref())
+    .bind(p.model_prefix.as_deref())
+    .bind(p.max_tokens_field.as_str())
+    .bind(serde_json::to_string(&p.extra_headers)?)
+    .bind(p.probe_script.as_deref())
+    .bind(p.probe_enabled.map(|b| b as i64))
+    .bind(p.probe_interval_secs.map(|s| s as i64))
+    .bind(p.quota_min)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Update an existing provider in place (`name` is the immutable PK). Returns the
+/// number of rows affected (0 = no such provider).
+pub async fn update_provider(pool: &SqlitePool, name: &str, p: &Provider) -> anyhow::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE providers SET \
+           wire = ?, base_url = ?, api_key = ?, model_prefix = ?, max_tokens_field = ?, \
+           extra_headers = ?, probe_script = ?, probe_enabled = ?, probe_interval_secs = ?, \
+           quota_min = ? \
+         WHERE name = ?",
+    )
+    .bind(wire_to_str(p.wire))
+    .bind(p.base_url.as_str())
+    .bind(p.api_key.as_deref())
+    .bind(p.model_prefix.as_deref())
+    .bind(p.max_tokens_field.as_str())
+    .bind(serde_json::to_string(&p.extra_headers)?)
+    .bind(p.probe_script.as_deref())
+    .bind(p.probe_enabled.map(|b| b as i64))
+    .bind(p.probe_interval_secs.map(|s| s as i64))
+    .bind(p.quota_min)
+    .bind(name)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Delete a provider. `ON DELETE CASCADE` removes its routes + status row. Returns
+/// rows affected (0 = no such provider).
+pub async fn delete_provider(pool: &SqlitePool, name: &str) -> anyhow::Result<u64> {
+    let res = sqlx::query("DELETE FROM providers WHERE name = ?")
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Insert a new route. Errors (UNIQUE violation) if `alias` already exists.
+pub async fn insert_route(pool: &SqlitePool, r: &Route) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO routes (alias, provider, model, fallback) VALUES (?, ?, ?, ?)")
+        .bind(r.alias.as_str())
+        .bind(r.provider.as_str())
+        .bind(r.model.as_str())
+        .bind(serde_json::to_string(&r.fallback)?)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Update an existing route (`alias` is the immutable PK). Returns rows affected.
+pub async fn update_route(pool: &SqlitePool, alias: &str, r: &Route) -> anyhow::Result<u64> {
+    let res =
+        sqlx::query("UPDATE routes SET provider = ?, model = ?, fallback = ? WHERE alias = ?")
+            .bind(r.provider.as_str())
+            .bind(r.model.as_str())
+            .bind(serde_json::to_string(&r.fallback)?)
+            .bind(alias)
+            .execute(pool)
+            .await?;
+    Ok(res.rows_affected())
+}
+
+/// Delete a route by alias. Returns rows affected (0 = no such route).
+pub async fn delete_route(pool: &SqlitePool, alias: &str) -> anyhow::Result<u64> {
+    let res = sqlx::query("DELETE FROM routes WHERE alias = ?")
+        .bind(alias)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 #[derive(sqlx::FromRow)]
@@ -152,20 +266,11 @@ struct RouteRow {
 }
 
 fn wire_to_str(w: WireName) -> &'static str {
-    match w {
-        WireName::OpenaiChat => "openai-chat",
-        WireName::OpenaiResponses => "openai-responses",
-        WireName::AnthropicMessages => "anthropic-messages",
-    }
+    w.as_str()
 }
 
 fn str_to_wire(s: &str) -> anyhow::Result<WireName> {
-    Ok(match s {
-        "openai-chat" => WireName::OpenaiChat,
-        "openai-responses" => WireName::OpenaiResponses,
-        "anthropic-messages" => WireName::AnthropicMessages,
-        other => anyhow::bail!("unknown wire format in DB: {other}"),
-    })
+    WireName::parse(s).ok_or_else(|| anyhow::anyhow!("unknown wire format in DB: {s}"))
 }
 
 /// Runtime watcher state for one provider (written by the watcher; read by the
@@ -361,6 +466,190 @@ fallback = [{ provider = "zen", model = "gpt-5.5" }]
         assert_eq!(route.fallback.len(), 1);
         assert_eq!(route.fallback[0].provider, "zen");
         assert_eq!(route.fallback[0].model, "gpt-5.5");
+    }
+
+    fn sample_provider(base_url: &str) -> Provider {
+        Provider {
+            wire: WireName::OpenaiChat,
+            base_url: base_url.to_string(),
+            api_key: Some("sk-orig".into()),
+            model_prefix: Some("opencode/".into()),
+            max_tokens_field: "max_tokens".into(),
+            extra_headers: HashMap::from([("x-foo".to_string(), "bar".to_string())]),
+            probe_script: Some("probes/zen.lua".into()),
+            probe_enabled: Some(true),
+            probe_interval_secs: Some(60),
+            quota_min: Some(1.5),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_crud_roundtrip() {
+        let pool = temp_pool().await;
+
+        // insert + get
+        insert_provider(&pool, "go", &sample_provider("https://go"))
+            .await
+            .unwrap();
+        let got = get_provider(&pool, "go").await.unwrap().unwrap();
+        assert_eq!(got.base_url, "https://go");
+        assert_eq!(got.api_key.as_deref(), Some("sk-orig"));
+        assert_eq!(
+            got.extra_headers.get("x-foo").map(String::as_str),
+            Some("bar")
+        );
+        assert_eq!(got.quota_min, Some(1.5));
+        assert!(got.probe_enabled());
+
+        // update changes fields, keeps the PK
+        let mut updated = sample_provider("https://go-2");
+        updated.api_key = Some("sk-new".into());
+        updated.quota_min = Some(9.0);
+        assert_eq!(update_provider(&pool, "go", &updated).await.unwrap(), 1);
+        let got = get_provider(&pool, "go").await.unwrap().unwrap();
+        assert_eq!(got.base_url, "https://go-2");
+        assert_eq!(got.api_key.as_deref(), Some("sk-new"));
+        assert_eq!(got.quota_min, Some(9.0));
+
+        // update of an absent provider affects 0 rows
+        assert_eq!(update_provider(&pool, "nope", &updated).await.unwrap(), 0);
+
+        // delete removes the row
+        assert_eq!(delete_provider(&pool, "go").await.unwrap(), 1);
+        assert!(get_provider(&pool, "go").await.unwrap().is_none());
+        assert_eq!(delete_provider(&pool, "go").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn insert_duplicate_provider_errors() {
+        let pool = temp_pool().await;
+        insert_provider(&pool, "go", &sample_provider("https://go"))
+            .await
+            .unwrap();
+        assert!(
+            insert_provider(&pool, "go", &sample_provider("https://go"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_provider_cascades_routes_and_status() {
+        let pool = temp_pool().await;
+        insert_provider(&pool, "go", &sample_provider("https://go"))
+            .await
+            .unwrap();
+        insert_route(
+            &pool,
+            &Route {
+                alias: "gpt-5.5".into(),
+                provider: "go".into(),
+                model: "deepseek-v4-pro".into(),
+                fallback: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        write_status(
+            &pool,
+            "go",
+            &ProviderStatus {
+                available: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        delete_provider(&pool, "go").await.unwrap();
+
+        let mut loaded = Config::from_toml("").unwrap();
+        load_into_config(&pool, &mut loaded).await.unwrap();
+        assert!(loaded.providers.is_empty());
+        assert!(loaded.routes.is_empty(), "route should cascade-delete");
+        assert!(
+            load_statuses(&pool).await.unwrap().is_empty(),
+            "status should cascade-delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_crud_roundtrip() {
+        let pool = temp_pool().await;
+        // routes FK-reference providers; create the providers first.
+        insert_provider(&pool, "go", &sample_provider("https://go"))
+            .await
+            .unwrap();
+        insert_provider(&pool, "zen", &sample_provider("https://zen"))
+            .await
+            .unwrap();
+
+        insert_route(
+            &pool,
+            &Route {
+                alias: "gpt-5.5".into(),
+                provider: "go".into(),
+                model: "deepseek-v4-pro".into(),
+                fallback: vec![crate::config::RouteTarget {
+                    provider: "zen".into(),
+                    model: "gpt-5.5".into(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let load = |pool: SqlitePool| async move {
+            let mut c = Config::from_toml("").unwrap();
+            load_into_config(&pool, &mut c).await.unwrap();
+            c.routes
+        };
+
+        let routes = load(pool.clone()).await;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].provider, "go");
+        assert_eq!(routes[0].fallback.len(), 1);
+
+        // update model + fallback
+        assert_eq!(
+            update_route(
+                &pool,
+                "gpt-5.5",
+                &Route {
+                    alias: "gpt-5.5".into(),
+                    provider: "zen".into(),
+                    model: "gpt-5.5-mini".into(),
+                    fallback: vec![],
+                }
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let routes = load(pool.clone()).await;
+        assert_eq!(routes[0].provider, "zen");
+        assert_eq!(routes[0].model, "gpt-5.5-mini");
+        assert!(routes[0].fallback.is_empty());
+
+        // update absent -> 0; delete -> 1 then 0
+        assert_eq!(
+            update_route(
+                &pool,
+                "nope",
+                &Route {
+                    alias: "nope".into(),
+                    provider: "zen".into(),
+                    model: "x".into(),
+                    fallback: vec![],
+                }
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(delete_route(&pool, "gpt-5.5").await.unwrap(), 1);
+        assert_eq!(delete_route(&pool, "gpt-5.5").await.unwrap(), 0);
+        assert!(load(pool).await.is_empty());
     }
 
     #[tokio::test]

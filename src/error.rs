@@ -9,6 +9,10 @@ use serde_json::json;
 pub enum BridgeError {
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
     #[error("unknown model: {0}")]
@@ -27,6 +31,8 @@ impl BridgeError {
     pub fn http_status(&self) -> StatusCode {
         match self {
             BridgeError::BadRequest(_) | BridgeError::UnknownModel(_) => StatusCode::BAD_REQUEST,
+            BridgeError::NotFound(_) => StatusCode::NOT_FOUND,
+            BridgeError::Conflict(_) => StatusCode::CONFLICT,
             BridgeError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             BridgeError::Upstream { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
