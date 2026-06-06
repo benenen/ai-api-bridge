@@ -8,6 +8,7 @@ use std::sync::{Mutex, RwLock};
 use ai_api_bridge::config::Config;
 use ai_api_bridge::server::{AppState, build_app};
 use ai_api_bridge::upstream::Upstream;
+use ai_api_bridge::usage::UsageMeter;
 use ai_api_bridge::{store, watcher};
 
 #[derive(Parser, Debug)]
@@ -81,12 +82,25 @@ async fn main() -> anyhow::Result<()> {
         status.clone(),
     ));
 
+    // Cost accumulator: prune events past the retention horizon, then seed the
+    // in-memory meter from what remains so rolling windows survive a restart.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let usage = Arc::new(UsageMeter::new(Some(pool.clone())));
+    let _ = store::prune_usage_events(&pool, now - 31 * 24 * 3600).await;
+    if let Ok(events) = store::load_usage_events(&pool, now - 31 * 24 * 3600).await {
+        usage.load(events);
+    }
+
     let state = Arc::new(AppState {
         config: RwLock::new(Arc::new(config)),
         upstream: Upstream::new(),
         status,
         pool: Some(pool),
         watchers,
+        usage,
     });
     let app = build_app(state);
 

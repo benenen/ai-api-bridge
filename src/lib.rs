@@ -8,5 +8,6 @@ pub mod server;
 pub mod sse;
 pub mod store;
 pub mod upstream;
+pub mod usage;
 pub mod watcher;
 pub mod wire;

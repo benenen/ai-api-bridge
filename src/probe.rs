@@ -210,6 +210,8 @@ mod tests {
             probe_enabled: None,
             probe_interval_secs: None,
             quota_min: None,
+            cost_windows: Vec::new(),
+            model_prices: HashMap::new(),
         }
     }
 

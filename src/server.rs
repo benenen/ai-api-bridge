@@ -16,14 +16,15 @@ use serde_json::{Value, json};
 use sqlx::sqlite::SqlitePool;
 
 use crate::canonical::{CanonicalEvent, CanonicalRequest};
-use crate::config::Config;
+use crate::config::{Config, ModelPrice};
 use crate::error::BridgeError;
 use crate::router::{self, Resolved};
 use crate::sse::{SseDecoder, SseItem};
 use crate::upstream::{ByteStream, Upstream};
+use crate::usage::UsageMeter;
 use crate::watcher::{self, StatusMap, WatcherHandles};
 use crate::wire::{CanonicalEmitter, anthropic, chat, responses};
-use crate::{probe, store};
+use crate::{probe, store, usage};
 
 pub struct AppState {
     /// The live provider/route config. Wrapped in `RwLock<Arc<_>>` so admin CRUD
@@ -36,6 +37,33 @@ pub struct AppState {
     pub pool: Option<SqlitePool>,
     /// Running probe-task handles, aborted + respawned on a provider change.
     pub watchers: WatcherHandles,
+    /// Rolling per-provider cost accumulator (windows + failover input).
+    pub usage: Arc<UsageMeter>,
+}
+
+/// Records the served provider's cost when a (streaming) response finishes. Holds
+/// the served model's price so spend can be estimated when the upstream reports $0.
+struct CostRecorder {
+    meter: Arc<UsageMeter>,
+    provider: String,
+    price: Option<ModelPrice>,
+}
+
+/// Look up the configured PAYG price for a provider's upstream model (for the
+/// token-based estimate when the upstream reports `cost = $0`).
+fn price_for(cfg: &Config, provider: &str, model: &str) -> Option<ModelPrice> {
+    cfg.providers
+        .get(provider)
+        .and_then(|p| p.model_prices.get(model))
+        .copied()
+}
+
+/// Current unix time in seconds (for cost-event timestamps).
+pub(crate) fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl AppState {
@@ -113,6 +141,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
 async fn providers_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let cfg = state.config();
     let status = state.status.read().ok();
+    let now = now_secs();
     let mut providers: Vec<Value> = cfg
         .providers
         .iter()
@@ -135,6 +164,7 @@ async fn providers_status(State(state): State<Arc<AppState>>) -> Json<Value> {
                 "last_ok": s.last_ok,
                 "error": s.error,
                 "note": s.note,
+                "cost_windows": state.usage.windows(name, &p.cost_windows, now),
             })
         })
         .collect();
@@ -177,24 +207,52 @@ async fn responses_handler(
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let candidates = {
         let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        router::resolve_candidates(&cfg, &status, &req.model)?
+        let exhausted = state.usage.exhausted_set(&cfg.providers, now_secs());
+        router::resolve_candidates(&cfg, &status, &exhausted, &req.model)?
     };
     tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, "responses request");
 
     if req.stream {
-        let byte_stream = open_upstream_stream(&state, &req, &candidates).await?;
-        Ok(
-            run_stream(byte_stream, response_id, responses::ResponsesEmitter::new())
-                .into_response(),
+        let (provider, model, byte_stream) =
+            open_upstream_stream(&state, &req, &candidates).await?;
+        let price = price_for(&cfg, &provider, &model);
+        Ok(run_stream(
+            byte_stream,
+            response_id,
+            responses::ResponsesEmitter::new(),
+            Some(CostRecorder {
+                meter: state.usage.clone(),
+                provider,
+                price,
+            }),
         )
+        .into_response())
     } else {
-        let upstream_resp = call_upstream_json(&state, &req, &candidates).await?;
+        let (provider, model, upstream_resp) =
+            call_upstream_json(&state, &req, &candidates).await?;
+        record_cost(
+            &state,
+            &provider,
+            price_for(&cfg, &provider, &model),
+            &upstream_resp,
+        )
+        .await;
         let events = chat::completion_to_events(&upstream_resp, &response_id);
         let mut emitter = responses::ResponsesEmitter::new();
         for ev in &events {
             emitter.on_event(ev);
         }
         Ok(Json(emitter.final_response()).into_response())
+    }
+}
+
+/// Record a non-stream response's cost against the served provider — the real
+/// `cost` if non-zero, otherwise a token×price estimate.
+async fn record_cost(state: &AppState, provider: &str, price: Option<ModelPrice>, resp: &Value) {
+    let real = resp.get("cost").and_then(usage::parse_cost);
+    let (pt, ct) = usage::tokens_from_usage(resp.get("usage"));
+    if let Some(c) = usage::effective_cost(real, price.as_ref(), pt, ct) {
+        state.usage.record(provider, c, now_secs()).await;
     }
 }
 
@@ -205,11 +263,19 @@ fn run_stream<E: CanonicalEmitter + Send + 'static>(
     byte_stream: impl Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
     response_id: String,
     mut emitter: E,
+    recorder: Option<CostRecorder>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let s = stream! {
         let mut decoder = SseDecoder::default();
         let mut parser = chat::ChatStreamParser::new(response_id);
         let mut completed = false;
+        // After `[DONE]` we keep draining the upstream (without yielding more client
+        // frames) only to catch the trailing `{"cost":...}` chunk Zen sends last.
+        let mut done = false;
+        let mut cost: Option<f64> = None;
+        // Token usage (from the `usage` chunk) for the price estimate when cost is $0.
+        let mut ptok: Option<u64> = None;
+        let mut ctok: Option<u64> = None;
 
         futures_util::pin_mut!(byte_stream);
         'outer: while let Some(chunk) = byte_stream.next().await {
@@ -219,6 +285,17 @@ fn run_stream<E: CanonicalEmitter + Send + 'static>(
                         match item {
                             SseItem::Data(d) => {
                                 let Ok(json) = serde_json::from_str::<Value>(&d) else { continue };
+                                // Capture cost from any chunk that carries it (Zen: after [DONE]).
+                                if let Some(c) = json.get("cost").and_then(usage::parse_cost) {
+                                    cost = Some(c);
+                                }
+                                // Capture token usage (the `usage` chunk arrives before [DONE]).
+                                let (pt, ct) = usage::tokens_from_usage(json.get("usage"));
+                                if pt.is_some() { ptok = pt; }
+                                if ct.is_some() { ctok = ct; }
+                                if done {
+                                    continue; // past [DONE]: sniff cost only, don't emit
+                                }
                                 for cev in parser.on_chunk(&json) {
                                     let is_error = matches!(cev, CanonicalEvent::Error { .. });
                                     for fr in emitter.emit(&cev) {
@@ -235,7 +312,8 @@ fn run_stream<E: CanonicalEmitter + Send + 'static>(
                                     yield Ok(Event::default().event(fr.event).data(fr.data.to_string()));
                                 }
                                 completed = true;
-                                break 'outer;
+                                done = true;
+                                // Don't break: drain to upstream EOF to catch the cost chunk.
                             }
                         }
                     }
@@ -255,6 +333,12 @@ fn run_stream<E: CanonicalEmitter + Send + 'static>(
             for fr in emitter.emit(&CanonicalEvent::Completed) {
                 yield Ok(Event::default().event(fr.event).data(fr.data.to_string()));
             }
+        }
+
+        if let Some(r) = &recorder
+            && let Some(c) = usage::effective_cost(cost, r.price.as_ref(), ptok, ctok)
+        {
+            r.meter.record(&r.provider, c, now_secs()).await;
         }
     };
     Sse::new(s)
@@ -307,7 +391,7 @@ async fn open_upstream_stream(
     state: &AppState,
     req: &CanonicalRequest,
     candidates: &[Resolved<'_>],
-) -> Result<ByteStream, BridgeError> {
+) -> Result<(String, String, ByteStream), BridgeError> {
     let mut last_err: Option<BridgeError> = None;
     let n = candidates.len();
     for (i, cand) in candidates.iter().enumerate() {
@@ -321,7 +405,11 @@ async fn open_upstream_stream(
                 if i > 0 {
                     tracing::info!(provider = %cand.provider_name, attempt = i + 1, "reactive failover: upstream accepted");
                 }
-                return Ok(stream);
+                return Ok((
+                    cand.provider_name.clone(),
+                    cand.upstream_model.clone(),
+                    stream,
+                ));
             }
             Err(e) if is_retryable(&e) && i + 1 < n => {
                 tracing::warn!(provider = %cand.provider_name, "upstream failed, trying next: {e}");
@@ -339,7 +427,7 @@ async fn call_upstream_json(
     state: &AppState,
     req: &CanonicalRequest,
     candidates: &[Resolved<'_>],
-) -> Result<Value, BridgeError> {
+) -> Result<(String, String, Value), BridgeError> {
     let mut last_err: Option<BridgeError> = None;
     let n = candidates.len();
     for (i, cand) in candidates.iter().enumerate() {
@@ -353,7 +441,11 @@ async fn call_upstream_json(
                 if i > 0 {
                     tracing::info!(provider = %cand.provider_name, attempt = i + 1, "reactive failover: upstream accepted");
                 }
-                return Ok(json);
+                return Ok((
+                    cand.provider_name.clone(),
+                    cand.upstream_model.clone(),
+                    json,
+                ));
             }
             Err(e) if is_retryable(&e) && i + 1 < n => {
                 tracing::warn!(provider = %cand.provider_name, "upstream failed, trying next: {e}");
@@ -379,18 +471,23 @@ async fn chat_handler(
     let req = chat::parse_request(&body)?;
     let candidates = {
         let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        router::resolve_candidates(&cfg, &status, &req.model)?
+        let exhausted = state.usage.exhausted_set(&cfg.providers, now_secs());
+        router::resolve_candidates(&cfg, &status, &exhausted, &req.model)?
     };
 
     if req.stream {
-        let byte_stream = open_upstream_stream(&state, &req, &candidates).await?;
+        // Passthrough streaming forwards bytes verbatim; cost is not captured here
+        // (the trailing post-[DONE] cost chunk isn't parsed on this path — by design).
+        let (_provider, _model, byte_stream) =
+            open_upstream_stream(&state, &req, &candidates).await?;
         let resp = Response::builder()
             .header("content-type", "text/event-stream")
             .body(Body::from_stream(byte_stream))
             .map_err(|e| BridgeError::Internal(e.to_string()))?;
         Ok(resp)
     } else {
-        let resp = call_upstream_json(&state, &req, &candidates).await?;
+        let (provider, model, resp) = call_upstream_json(&state, &req, &candidates).await?;
+        record_cost(&state, &provider, price_for(&cfg, &provider, &model), &resp).await;
         Ok(Json(resp).into_response())
     }
 }
@@ -420,18 +517,36 @@ async fn messages_handler(
     let response_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let candidates = {
         let status = state.status.read().unwrap_or_else(|e| e.into_inner());
-        router::resolve_candidates(&cfg, &status, &req.model)?
+        let exhausted = state.usage.exhausted_set(&cfg.providers, now_secs());
+        router::resolve_candidates(&cfg, &status, &exhausted, &req.model)?
     };
     tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, "messages request");
 
     if req.stream {
-        let byte_stream = open_upstream_stream(&state, &req, &candidates).await?;
-        Ok(
-            run_stream(byte_stream, response_id, anthropic::AnthropicEmitter::new())
-                .into_response(),
+        let (provider, model, byte_stream) =
+            open_upstream_stream(&state, &req, &candidates).await?;
+        let price = price_for(&cfg, &provider, &model);
+        Ok(run_stream(
+            byte_stream,
+            response_id,
+            anthropic::AnthropicEmitter::new(),
+            Some(CostRecorder {
+                meter: state.usage.clone(),
+                provider,
+                price,
+            }),
         )
+        .into_response())
     } else {
-        let upstream_resp = call_upstream_json(&state, &req, &candidates).await?;
+        let (provider, model, upstream_resp) =
+            call_upstream_json(&state, &req, &candidates).await?;
+        record_cost(
+            &state,
+            &provider,
+            price_for(&cfg, &provider, &model),
+            &upstream_resp,
+        )
+        .await;
         let events = chat::completion_to_events(&upstream_resp, &response_id);
         let mut emitter = anthropic::AnthropicEmitter::new();
         for ev in &events {

@@ -96,6 +96,7 @@ model_prefix = "opencode/"
         status: Default::default(),
         pool: None,
         watchers: Default::default(),
+        usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
     })))
     .await;
 
@@ -129,6 +130,7 @@ async fn inband_upstream_error_becomes_response_failed() {
         status: Default::default(),
         pool: None,
         watchers: Default::default(),
+        usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -157,6 +159,7 @@ async fn unknown_model_returns_400() {
         status: Default::default(),
         pool: None,
         watchers: Default::default(),
+        usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -180,6 +183,7 @@ async fn lists_models() {
         status: Default::default(),
         pool: None,
         watchers: Default::default(),
+        usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
     })))
     .await;
     let body: serde_json::Value = reqwest::get(format!("{url}/v1/models"))
@@ -215,6 +219,7 @@ async fn messages_streaming_end_to_end() {
         status: Default::default(),
         pool: None,
         watchers: Default::default(),
+        usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
     })))
     .await;
 
@@ -251,6 +256,7 @@ async fn messages_non_streaming_end_to_end() {
         status: Default::default(),
         pool: None,
         watchers: Default::default(),
+        usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
     })))
     .await;
 
@@ -284,6 +290,7 @@ async fn messages_tool_use_streaming() {
         status: Default::default(),
         pool: None,
         watchers: Default::default(),
+        usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
     })))
     .await;
 
@@ -315,6 +322,7 @@ async fn messages_missing_model_returns_400() {
         status: Default::default(),
         pool: None,
         watchers: Default::default(),
+        usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
     })))
     .await;
     let resp = reqwest::Client::new()
@@ -347,6 +355,7 @@ fn app(cfg: Config) -> Router {
         status: Default::default(),
         pool: None,
         watchers: Default::default(),
+        usage: std::sync::Arc::new(ai_api_bridge::usage::UsageMeter::new(None)),
     }))
 }
 

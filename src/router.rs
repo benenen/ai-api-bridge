@@ -1,7 +1,7 @@
 //! Model alias -> ordered provider candidate chain, for proactive (watcher
 //! status) + reactive (per-request error) failover.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::config::{Config, Provider};
 use crate::error::BridgeError;
@@ -21,6 +21,7 @@ pub struct Resolved<'a> {
 pub fn resolve_candidates<'a>(
     cfg: &'a Config,
     status: &HashMap<String, ProviderStatus>,
+    cost_exhausted: &HashSet<String>,
     alias: &str,
 ) -> Result<Vec<Resolved<'a>>, BridgeError> {
     let raw: Vec<(String, String)> =
@@ -56,7 +57,9 @@ pub fn resolve_candidates<'a>(
             provider,
             upstream_model: model,
         };
-        if is_usable(provider, status.get(&pname)) {
+        // Cost-exhausted providers are demoted like any other degraded provider:
+        // tried only as a last resort (so a healthy fallback wins) but not dropped.
+        if is_usable(provider, status.get(&pname)) && !cost_exhausted.contains(&pname) {
             usable.push(resolved);
         } else {
             degraded.push(resolved);
@@ -122,14 +125,14 @@ model = "opencode/gpt-5.5-mini"
     #[test]
     fn explicit_route_wins() {
         let c = cfg();
-        let cands = resolve_candidates(&c, &no_status(), "fast").unwrap();
+        let cands = resolve_candidates(&c, &no_status(), &HashSet::new(), "fast").unwrap();
         assert_eq!(cands[0].upstream_model, "opencode/gpt-5.5-mini");
     }
 
     #[test]
     fn default_provider_applies_prefix() {
         let c = cfg();
-        let cands = resolve_candidates(&c, &no_status(), "gpt-5.5").unwrap();
+        let cands = resolve_candidates(&c, &no_status(), &HashSet::new(), "gpt-5.5").unwrap();
         assert_eq!(cands[0].provider_name, "zen");
         assert_eq!(cands[0].upstream_model, "opencode/gpt-5.5");
     }
@@ -137,14 +140,15 @@ model = "opencode/gpt-5.5-mini"
     #[test]
     fn prefix_skipped_when_alias_already_qualified() {
         let c = cfg();
-        let cands = resolve_candidates(&c, &no_status(), "anthropic/claude").unwrap();
+        let cands =
+            resolve_candidates(&c, &no_status(), &HashSet::new(), "anthropic/claude").unwrap();
         assert_eq!(cands[0].upstream_model, "anthropic/claude");
     }
 
     #[test]
     fn unknown_model_without_default_errors() {
         let c = Config::from_toml("[providers.x]\nwire=\"openai-chat\"\nbase_url=\"u\"").unwrap();
-        let err = resolve_candidates(&c, &no_status(), "whatever").unwrap_err();
+        let err = resolve_candidates(&c, &no_status(), &HashSet::new(), "whatever").unwrap_err();
         assert!(matches!(err, BridgeError::UnknownModel(_)));
     }
 
@@ -173,7 +177,7 @@ fallback = [{ provider = "zen", model = "gpt-5.5" }]
         let mut s = HashMap::new();
         s.insert("go".to_string(), status(true, Some(10.0)));
         let c = failover_cfg();
-        let cands = resolve_candidates(&c, &s, "gpt-5.5").unwrap();
+        let cands = resolve_candidates(&c, &s, &HashSet::new(), "gpt-5.5").unwrap();
         assert_eq!(cands.len(), 2);
         assert_eq!(cands[0].provider_name, "go");
         assert_eq!(cands[0].upstream_model, "deepseek-v4-pro");
@@ -186,7 +190,7 @@ fallback = [{ provider = "zen", model = "gpt-5.5" }]
         s.insert("go".to_string(), status(false, None));
         s.insert("zen".to_string(), status(true, None));
         let c = failover_cfg();
-        let cands = resolve_candidates(&c, &s, "gpt-5.5").unwrap();
+        let cands = resolve_candidates(&c, &s, &HashSet::new(), "gpt-5.5").unwrap();
         assert_eq!(cands[0].provider_name, "zen"); // usable first
         assert_eq!(cands[1].provider_name, "go"); // degraded last (last resort)
     }
@@ -197,7 +201,7 @@ fallback = [{ provider = "zen", model = "gpt-5.5" }]
         s.insert("go".to_string(), status(true, Some(0.0))); // below quota_min 1.0
         s.insert("zen".to_string(), status(true, None));
         let c = failover_cfg();
-        let cands = resolve_candidates(&c, &s, "gpt-5.5").unwrap();
+        let cands = resolve_candidates(&c, &s, &HashSet::new(), "gpt-5.5").unwrap();
         assert_eq!(cands[0].provider_name, "zen");
     }
 
@@ -207,8 +211,20 @@ fallback = [{ provider = "zen", model = "gpt-5.5" }]
         s.insert("go".to_string(), status(false, None));
         s.insert("zen".to_string(), status(false, None));
         let c = failover_cfg();
-        let cands = resolve_candidates(&c, &s, "gpt-5.5").unwrap();
+        let cands = resolve_candidates(&c, &s, &HashSet::new(), "gpt-5.5").unwrap();
         assert_eq!(cands[0].provider_name, "go"); // primary tried first
         assert_eq!(cands[1].provider_name, "zen");
+    }
+
+    #[test]
+    fn cost_exhausted_primary_ordered_last() {
+        let mut s = HashMap::new();
+        s.insert("go".to_string(), status(true, None));
+        s.insert("zen".to_string(), status(true, None));
+        let c = failover_cfg();
+        let ex = HashSet::from(["go".to_string()]); // go's cost window is spent
+        let cands = resolve_candidates(&c, &s, &ex, "gpt-5.5").unwrap();
+        assert_eq!(cands[0].provider_name, "zen"); // healthy fallback first
+        assert_eq!(cands[1].provider_name, "go"); // exhausted primary demoted
     }
 }

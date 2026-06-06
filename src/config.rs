@@ -51,6 +51,43 @@ pub struct Provider {
     /// Below this `quota_remaining` the provider counts as exhausted (for failover).
     #[serde(default)]
     pub quota_min: Option<f64>,
+    /// Rolling cost windows (e.g. Zen Go: $12/5h, $30/7d, $60/30d). Empty = the
+    /// provider is not cost-tracked. Spend is accumulated from each completion's
+    /// `cost` field; a window with `remaining <= 0` makes the provider fail over.
+    #[serde(default)]
+    pub cost_windows: Vec<CostWindow>,
+    /// Per-model pay-as-you-go prices, keyed by the upstream model name. Used to
+    /// estimate spend (tokens × price) when the upstream reports `cost = $0` — as
+    /// subscription plans like Zen Go do. Real non-zero `cost` always wins.
+    #[serde(default)]
+    pub model_prices: HashMap<String, ModelPrice>,
+}
+
+/// Pay-as-you-go price for one model, in dollars per 1M tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ModelPrice {
+    /// Input (prompt) price per 1M tokens.
+    pub input: f64,
+    /// Output (completion) price per 1M tokens.
+    pub output: f64,
+}
+
+impl ModelPrice {
+    /// Estimated dollar cost of a request from its token counts.
+    pub fn estimate(&self, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+        (prompt_tokens as f64 / 1e6) * self.input + (completion_tokens as f64 / 1e6) * self.output
+    }
+}
+
+/// One rolling cost window: spend over the last `window_secs` is capped at `limit`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostWindow {
+    /// Display label, e.g. "5h" / "7d" / "30d".
+    pub label: String,
+    /// Window length in seconds (5h = 18000, 7d = 604800, 30d = 2592000).
+    pub window_secs: u64,
+    /// Spend cap for the window (dollars).
+    pub limit: f64,
 }
 
 fn default_max_tokens_field() -> String {

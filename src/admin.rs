@@ -15,9 +15,9 @@ use axum::response::Html;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::{Provider, Route, RouteTarget, WireName};
+use crate::config::{CostWindow, ModelPrice, Provider, Route, RouteTarget, WireName};
 use crate::error::BridgeError;
-use crate::server::{AppState, check_auth, reload_from_db};
+use crate::server::{AppState, check_auth, now_secs, reload_from_db};
 use crate::store;
 
 /// The embedded management page (single self-contained file, no runtime CDN).
@@ -65,6 +65,10 @@ pub struct ProviderInput {
     pub probe_interval_secs: Option<u64>,
     #[serde(default)]
     pub quota_min: Option<f64>,
+    #[serde(default)]
+    pub cost_windows: Vec<CostWindow>,
+    #[serde(default)]
+    pub model_prices: HashMap<String, ModelPrice>,
 }
 
 /// Drop empty strings to `None` so blank form fields don't persist as `Some("")`.
@@ -99,6 +103,8 @@ impl ProviderInput {
             probe_enabled: self.probe_enabled,
             probe_interval_secs: self.probe_interval_secs,
             quota_min: self.quota_min,
+            cost_windows: self.cost_windows,
+            model_prices: self.model_prices,
         })
     }
 }
@@ -113,6 +119,7 @@ pub async fn list_providers(
     check_auth(&cfg, &headers)?;
 
     let status = state.status.read().ok();
+    let now = now_secs();
     let mut providers: Vec<Value> = cfg
         .providers
         .iter()
@@ -122,6 +129,24 @@ pub async fn list_providers(
                 .and_then(|m| m.get(name))
                 .cloned()
                 .unwrap_or_default();
+            // Merge each window's config (label/window_secs/limit — for the edit form)
+            // with its live spend (spent/remaining/reset_in_secs — for the bars).
+            let stats = state.usage.windows(name, &p.cost_windows, now);
+            let cost_windows: Vec<Value> = p
+                .cost_windows
+                .iter()
+                .zip(stats)
+                .map(|(w, st)| {
+                    json!({
+                        "label": w.label,
+                        "window_secs": w.window_secs,
+                        "limit": w.limit,
+                        "spent": st.spent,
+                        "remaining": st.remaining,
+                        "reset_in_secs": st.reset_in_secs,
+                    })
+                })
+                .collect();
             json!({
                 "name": name,
                 "wire": p.wire.as_str(),
@@ -135,6 +160,8 @@ pub async fn list_providers(
                 "probe_enabled_override": p.probe_enabled,
                 "probe_interval_secs": p.probe_interval_secs,
                 "quota_min": p.quota_min,
+                "cost_windows": cost_windows,
+                "model_prices": p.model_prices,
                 "status": {
                     "available": s.available,
                     "quota_remaining": s.quota_remaining,
