@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  ai-api-bridge:
+    image: ghcr.io/benenen/ai-api-bridge:latest
+    container_name: ai-api-bridge
+    restart: unless-stopped
+    ports:
+      - "8282:8282"
+    volumes:
+      - ./bridge.toml:/etc/ai-api-bridge/bridge.toml:ro
+      - ./data:/data
+    command:
+      - "--config"
+      - "/etc/ai-api-bridge/bridge.toml"
+      - "--listen"
+      - "0.0.0.0:8282"
+      - "--db"
+      - "/data/bridge.db"
