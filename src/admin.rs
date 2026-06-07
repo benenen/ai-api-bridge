@@ -431,3 +431,29 @@ pub async fn delete_route(
 fn internal(e: anyhow::Error) -> BridgeError {
     BridgeError::Internal(e.to_string())
 }
+
+/// `GET /admin/api/probes` — list .lua files in the probes/ directory.
+pub async fn list_probe_files(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, BridgeError> {
+    let cfg = state.config();
+    check_auth(&cfg, &headers)?;
+
+    let mut files = Vec::new();
+    let probes_dir = std::path::Path::new("probes");
+    if probes_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(probes_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e == "lua") {
+                    if let Some(name) = path.to_str() {
+                        files.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    files.sort();
+    Ok(Json(json!({ "files": files })))
+}

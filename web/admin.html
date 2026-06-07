@@ -216,7 +216,7 @@
   .scrim.open { display: flex; animation: fade .2s ease both; }
   @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
   .modal {
-    width: 100%; max-width: 560px; position: relative;
+    width: 100%; max-width: 720px; position: relative;
     background: linear-gradient(180deg, var(--panel-2), var(--panel));
     border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow);
     animation: pop .26s cubic-bezier(.2,.8,.2,1) both;
@@ -257,6 +257,23 @@
     background: var(--bg) !important; color: var(--ink-bold) !important;
     border-color: var(--line) !important; min-height: 180px !important;
   }
+
+  /* ── probe file autocomplete ────────────────────────── */
+  .ac-wrap { position: relative; }
+  .ac-list {
+    display: none; position: absolute; top: 100%; left: 0; right: 0; z-index: 100;
+    background: var(--raised); border: 1px solid var(--line); border-radius: 0 0 7px 7px;
+    max-height: 180px; overflow-y: auto; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  }
+  .ac-list.open { display: block; }
+  .ac-item {
+    font-family: var(--mono); font-size: 12px; padding: 7px 12px;
+    color: var(--ink); cursor: pointer; border-bottom: 1px solid var(--line-soft);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ac-item:last-child { border-bottom: none; }
+  .ac-item:hover, .ac-item.active { background: var(--accent-dk); color: var(--accent); }
+  .ac-item .hl { color: var(--accent); font-weight: 600; }
   select { appearance: none;
     background-image: linear-gradient(45deg, transparent 50%, var(--dim) 50%), linear-gradient(135deg, var(--dim) 50%, transparent 50%);
     background-position: calc(100% - 16px) 18px, calc(100% - 11px) 18px;
@@ -395,7 +412,10 @@
               </span>
             </div>
             <div id="probePathRow">
-              <input name="probe_script" placeholder="probes/zen.lua" />
+              <div class="ac-wrap">
+              <input name="probe_script" placeholder="probes/zen.lua" autocomplete="off" id="probeScriptInput" />
+              <div class="ac-list" id="probeScriptList"></div>
+            </div>
             </div>
             <div id="probeTextRow" style="display:none">
               <textarea name="probe_script_text" class="lua-editor" spellcheck="false" rows="12"
@@ -794,6 +814,115 @@ function openProviderModal(name) {
   }
   openScrim("#providerScrim");
 }
+
+
+/* ── probe file autocomplete ────────────────────────────── */
+let probeFiles = [];
+let probeFileFilter = "";
+let probeFileIdx = -1;
+
+async function loadProbeFiles() {
+  try { const r = await api("GET", "/admin/api/probes"); probeFiles = r.files || []; }
+  catch (_) { probeFiles = []; }
+}
+loadProbeFiles();
+
+function fuzzyMatch(pat, str) {
+  pat = pat.toLowerCase(); str = str.toLowerCase();
+  let pi = 0;
+  for (let si = 0; si < str.length && pi < pat.length; si++) {
+    if (str[si] === pat[pi]) pi++;
+  }
+  return pi === pat.length;
+}
+
+function renderProbeList(filter) {
+  const list = $("#probeScriptList");
+  list.innerHTML = "";
+  probeFileIdx = -1;
+  if (!filter) { list.classList.remove("open"); return; }
+  const matches = probeFiles.filter(f => fuzzyMatch(filter, f)).slice(0, 12);
+  if (!matches.length) { list.classList.remove("open"); return; }
+  matches.forEach((f, i) => {
+    const item = el("div", { class: "ac-item", dataset: { idx: i }, text: f });
+    // highlight matching chars
+    const lower = f.toLowerCase(); const pat = filter.toLowerCase();
+    let html = ""; let pi = 0;
+    for (let si = 0; si < lower.length && pi < pat.length; si++) {
+      if (lower[si] === pat[pi]) { html += '<span class="hl">' + f[si] + '</span>'; pi++; }
+      else html += f[si];
+    }
+    html += f.slice(lower.indexOf(pat[pat.length - 1]) + 1);
+    // simpler: just use textContent, highlight via innerHTML rebuild
+    item.innerHTML = highlightMatch(f, filter);
+    item.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      selectProbeFile(f);
+    });
+    list.appendChild(item);
+  });
+  list.classList.add("open");
+}
+
+function highlightMatch(str, pat) {
+  if (!pat) return str;
+  const lower = str.toLowerCase(); const p = pat.toLowerCase();
+  let out = ""; let pi = 0;
+  for (let i = 0; i < str.length; i++) {
+    if (pi < p.length && lower[i] === p[pi]) {
+      out += '<span class="hl">' + str[i] + '</span>';
+      pi++;
+    } else {
+      out += str[i];
+    }
+  }
+  return out;
+}
+
+function selectProbeFile(name) {
+  const inp = $("#probeScriptInput");
+  inp.value = name;
+  $("#probeScriptList").classList.remove("open");
+  probeFileIdx = -1;
+  inp.focus();
+}
+
+$("#probeScriptInput").addEventListener("input", () => {
+  const v = $("#probeScriptInput").value;
+  probeFileFilter = v;
+  renderProbeList(v);
+});
+$("#probeScriptInput").addEventListener("keydown", (e) => {
+  const list = $("#probeScriptList");
+  const items = list.querySelectorAll(".ac-item");
+  if (!list.classList.contains("open")) return;
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    probeFileIdx = Math.min(probeFileIdx + 1, items.length - 1);
+    items.forEach((it, i) => it.classList.toggle("active", i === probeFileIdx));
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    probeFileIdx = Math.max(probeFileIdx - 1, -1);
+    items.forEach((it, i) => it.classList.toggle("active", i === probeFileIdx));
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    if (probeFileIdx >= 0 && items[probeFileIdx]) {
+      selectProbeFile(items[probeFileIdx].dataset.idx !== undefined
+        ? probeFiles.find((_, i) => i === parseInt(items[probeFileIdx].dataset.idx)) || items[probeFileIdx].textContent
+        : items[probeFileIdx].textContent);
+    }
+  } else if (e.key === "Escape") {
+    list.classList.remove("open");
+  }
+});
+$("#probeScriptInput").addEventListener("blur", () => {
+  setTimeout(() => $("#probeScriptList").classList.remove("open"), 150);
+});
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#probeScriptInput") && !e.target.closest("#probeScriptList")) {
+    $("#probeScriptList").classList.remove("open");
+  }
+});
 
 function toggleProbeSource(src) {
   const pathRow = $("#probePathRow");

@@ -241,7 +241,11 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         // Cost/usage tracking master switch.
         .route(
             "/admin/api/usage",
-            get(admin::get_usage).post(admin::set_usage),
+            get(admin::get_usage).post(admin::set_usage)
+        )
+        .route(
+            "/admin/api/probes",
+            get(admin::list_probe_files),
         )
         .with_state(state)
 }
