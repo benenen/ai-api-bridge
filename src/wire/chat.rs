@@ -389,7 +389,7 @@ fn usage_event(u: &Value) -> CanonicalEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Provider, WireName};
+    use crate::config::{ProbeSource, Provider, WireName};
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -402,6 +402,8 @@ mod tests {
             max_tokens_field: "max_tokens".into(),
             extra_headers: HashMap::new(),
             probe_script: None,
+            probe_script_text: None,
+            probe_source: ProbeSource::Path,
             probe_enabled: None,
             probe_interval_secs: None,
             quota_min: None,

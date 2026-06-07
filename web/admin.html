@@ -239,6 +239,24 @@
   input:focus, select:focus, textarea:focus { border-color: rgba(70,230,201,0.55); box-shadow: 0 0 0 3px rgba(70,230,201,0.1); }
   input:disabled { color: var(--dim); background: var(--panel); cursor: not-allowed; }
   textarea { resize: vertical; min-height: 64px; line-height: 1.45; }
+
+  /* ── probe source toggle ────────────────────────────── */
+  .src-toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+  .src-toggle button {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.8px;
+    padding: 6px 16px; border: none; background: var(--panel);
+    color: var(--dim); cursor: pointer; transition: all .15s;
+  }
+  .src-toggle button:first-child { border-right: 1px solid var(--line); }
+  .src-toggle button.active { background: var(--accent-dk); color: var(--accent); }
+  .src-toggle button:hover:not(.active) { color: var(--ink); background: var(--panel-2); }
+  /* ── Lua editor ─────────────────────────────────────── */
+  .lua-editor {
+    font-family: var(--mono) !important; font-size: 12px !important;
+    line-height: 1.5 !important; tab-size: 2;
+    background: var(--bg) !important; color: var(--ink-bold) !important;
+    border-color: var(--line) !important; min-height: 180px !important;
+  }
   select { appearance: none;
     background-image: linear-gradient(45deg, transparent 50%, var(--dim) 50%), linear-gradient(135deg, var(--dim) 50%, transparent 50%);
     background-position: calc(100% - 16px) 18px, calc(100% - 11px) 18px;
@@ -368,11 +386,23 @@
             <label>Extra headers <span class="opt">(JSON object)</span></label>
             <textarea name="extra_headers" spellcheck="false" placeholder='{ "x-foo": "bar" }'>{}</textarea>
           </div>
-          <div class="field row2">
-            <div>
-              <label>Probe script <span class="opt">(Lua path)</span></label>
+          <div class="field">
+            <label>Probe script <span class="opt" id="probeSrcLabel">— source: path</span></label>
+            <div style="margin-bottom:8px">
+              <span class="src-toggle" id="probeSrcToggle">
+                <button type="button" data-src="path" class="active">Path</button>
+                <button type="button" data-src="text">Text</button>
+              </span>
+            </div>
+            <div id="probePathRow">
               <input name="probe_script" placeholder="probes/zen.lua" />
             </div>
+            <div id="probeTextRow" style="display:none">
+              <textarea name="probe_script_text" class="lua-editor" spellcheck="false" rows="12"
+                placeholder="-- Lua probe script&#10;local resp = http {&#10;    url = ctx.base_url .. &quot;/usage&quot;,&#10;    headers = { authorization = &quot;Bearer &quot; .. (ctx.api_key or &quot;&quot;) },&#10;}&#10;return { ok = resp.status == 200 }"></textarea>
+            </div>
+          </div>
+          <div class="field row2">
             <div>
               <label>Watcher</label>
               <select name="probe_enabled">
@@ -381,10 +411,10 @@
                 <option value="off">off</option>
               </select>
             </div>
-          </div>
-          <div class="field">
-            <label>Probe interval <span class="opt">(seconds, default 300)</span></label>
-            <input name="probe_interval_secs" inputmode="numeric" placeholder="300" />
+            <div>
+              <label>Probe interval <span class="opt">(seconds, default 300)</span></label>
+              <input name="probe_interval_secs" inputmode="numeric" placeholder="300" />
+            </div>
           </div>
           <div class="field">
             <label>Usage <span class="opt">(JSON array of {usage_type: billing|count|token, windows[], model_prices?}; remaining 0 ⇒ fail over)</span></label>
@@ -581,7 +611,8 @@ function providerCard(p) {
   if (p.api_key_set) chips.appendChild(chip("key", "set"));
   const hdrs = Object.keys(p.extra_headers || {}).length;
   if (hdrs) chips.appendChild(el("span", { class: "chip" }, el("b", { text: String(hdrs) }), " hdr" + (hdrs > 1 ? "s" : "")));
-  if (p.probe_script) chips.appendChild(chip("probe", p.probe_script.split("/").pop()));
+  if (p.probe_source === "text" && p.probe_script_text) chips.appendChild(chip("probe", "inline"));
+  else if (p.probe_script) chips.appendChild(chip("probe", p.probe_script.split("/").pop()));
   if (p.quota_min != null) chips.appendChild(chip("floor", fmtNum(p.quota_min)));
   card.appendChild(el("div", { class: "meta" },
     el("div", { class: "urlrow" }, "↗ ", el("span", { class: "url", text: p.base_url })),
@@ -735,6 +766,11 @@ function openProviderModal(name) {
     f.quota_min.value = p.quota_min != null ? p.quota_min : "";
     f.extra_headers.value = JSON.stringify(p.extra_headers || {}, null, 2);
     f.probe_script.value = p.probe_script || "";
+    f.probe_script_text.value = p.probe_script_text || "";
+    // Set source toggle
+    const src = p.probe_source || "path";
+    $$("#probeSrcToggle button").forEach(b => b.classList.toggle("active", b.dataset.src === src));
+    toggleProbeSource(src);
     f.probe_enabled.value = p.probe_enabled_override === true ? "on" : p.probe_enabled_override === false ? "off" : "auto";
     f.probe_interval_secs.value = p.probe_interval_secs != null ? p.probe_interval_secs : "";
     // reconstruct the editable usage specs — drop runtime spent/remaining/reset/unit
@@ -752,9 +788,35 @@ function openProviderModal(name) {
   } else {
     f.api_key.placeholder = "sk-…";
     f.max_tokens_field.placeholder = "max_tokens";
+    f.probe_script_text.value = "";
+    $$("#probeSrcToggle button").forEach(b => b.classList.toggle("active", b.dataset.src === "path"));
+    toggleProbeSource("path");
   }
   openScrim("#providerScrim");
 }
+
+function toggleProbeSource(src) {
+  const pathRow = $("#probePathRow");
+  const textRow = $("#probeTextRow");
+  const label = $("#probeSrcLabel");
+  if (src === "text") {
+    pathRow.style.display = "none";
+    textRow.style.display = "";
+    label.textContent = " — source: text";
+  } else {
+    pathRow.style.display = "";
+    textRow.style.display = "none";
+    label.textContent = " — source: path";
+  }
+}
+$("#probeSrcToggle").addEventListener("click", (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  const src = btn.dataset.src;
+  $$("#probeSrcToggle button").forEach(b => b.classList.toggle("active", b.dataset.src === src));
+  toggleProbeSource(src);
+});
+
 $("#providerForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target;
@@ -769,7 +831,14 @@ $("#providerForm").addEventListener("submit", async (e) => {
   catch (_) { errEl.textContent = "Extra headers must be valid JSON."; errEl.classList.add("show"); return; }
   try { p.usage = f.usage.value.trim() ? JSON.parse(f.usage.value) : []; }
   catch (_) { errEl.textContent = "Usage must be valid JSON (array of typed specs)."; errEl.classList.add("show"); return; }
-  const ps = f.probe_script.value.trim(); if (ps) p.probe_script = ps;
+  const ps = f.probe_script.value.trim();
+  const src = $$("#probeSrcToggle button.active")[0]?.dataset?.src || "path";
+  if (ps && src === "path") p.probe_script = ps;
+  p.probe_source = src;
+  if (src === "text") {
+    const pt = f.probe_script_text.value.trim();
+    if (pt) p.probe_script_text = pt;
+  }
   if (f.probe_enabled.value === "on") p.probe_enabled = true;
   else if (f.probe_enabled.value === "off") p.probe_enabled = false;
   const pi = f.probe_interval_secs.value.trim(); if (pi) p.probe_interval_secs = parseInt(pi, 10);

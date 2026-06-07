@@ -34,6 +34,20 @@ fn default_database() -> String {
     "bridge.db".to_string()
 }
 
+/// Whether a probe script is a file path or inline text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeSource {
+    Path,
+    Text,
+}
+
+impl Default for ProbeSource {
+    fn default() -> Self {
+        ProbeSource::Path
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Provider {
     pub wire: WireName,
@@ -49,7 +63,13 @@ pub struct Provider {
     /// Path to a Lua quota probe (see `probes/`). Absent = availability-ping only.
     #[serde(default)]
     pub probe_script: Option<String>,
-    /// Explicit on/off for the watcher (defaults to on when `probe_script` is set).
+    /// Inline Lua probe script text (used when `probe_source` is `text`).
+    #[serde(default)]
+    pub probe_script_text: Option<String>,
+    /// Whether to use `probe_script` (file path) or `probe_script_text` (inline).
+    #[serde(default)]
+    pub probe_source: ProbeSource,
+    /// Explicit on/off for the watcher (defaults to on when a script source is set).
     #[serde(default)]
     pub probe_enabled: Option<bool>,
     /// Seconds between probes (default 300).
@@ -206,7 +226,14 @@ fn default_max_tokens_field() -> String {
 impl Provider {
     /// Whether the watcher should run for this provider.
     pub fn probe_enabled(&self) -> bool {
-        self.probe_enabled.unwrap_or(self.probe_script.is_some())
+        self.probe_enabled.unwrap_or(match self.probe_source {
+            ProbeSource::Path => self.probe_script.is_some(),
+            ProbeSource::Text => self
+                .probe_script_text
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false),
+        })
     }
 
     /// Probe interval (default 300s).

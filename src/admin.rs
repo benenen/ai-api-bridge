@@ -15,7 +15,7 @@ use axum::response::Html;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::{CostWindow, ModelPrice, Provider, Route, RouteTarget, UsageSpec, WireName};
+use crate::config::{CostWindow, ModelPrice, ProbeSource, Provider, Route, RouteTarget, UsageSpec, WireName};
 use crate::error::BridgeError;
 use crate::server::{AppState, check_auth, now_secs, reload_from_db};
 use crate::store;
@@ -58,6 +58,10 @@ pub struct ProviderInput {
     pub extra_headers: HashMap<String, String>,
     #[serde(default)]
     pub probe_script: Option<String>,
+    #[serde(default)]
+    pub probe_script_text: Option<String>,
+    #[serde(default)]
+    pub probe_source: Option<String>,
     /// Explicit watcher on/off (null = auto: on when `probe_script` is set).
     #[serde(default)]
     pub probe_enabled: Option<bool>,
@@ -76,6 +80,13 @@ pub struct ProviderInput {
 /// Drop empty strings to `None` so blank form fields don't persist as `Some("")`.
 fn non_empty(s: Option<String>) -> Option<String> {
     s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn parse_probe_source(s: Option<&str>) -> ProbeSource {
+    match s {
+        Some("text") => ProbeSource::Text,
+        _ => ProbeSource::Path,
+    }
 }
 
 impl ProviderInput {
@@ -102,6 +113,8 @@ impl ProviderInput {
                 .unwrap_or_else(|| "max_tokens".to_string()),
             extra_headers: self.extra_headers,
             probe_script: non_empty(self.probe_script),
+            probe_script_text: non_empty(self.probe_script_text),
+            probe_source: parse_probe_source(self.probe_source.as_deref()),
             probe_enabled: self.probe_enabled,
             probe_interval_secs: self.probe_interval_secs,
             quota_min: self.quota_min,
@@ -148,6 +161,8 @@ pub async fn list_providers(
                 "max_tokens_field": p.max_tokens_field,
                 "extra_headers": p.extra_headers,
                 "probe_script": p.probe_script,
+                "probe_script_text": p.probe_script_text,
+                "probe_source": match p.probe_source { ProbeSource::Path => "path", ProbeSource::Text => "text" },
                 "probe_enabled": p.probe_enabled(),
                 "probe_enabled_override": p.probe_enabled,
                 "probe_interval_secs": p.probe_interval_secs,

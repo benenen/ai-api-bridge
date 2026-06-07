@@ -9,19 +9,26 @@ use std::time::Duration;
 
 use mlua::{Lua, LuaSerdeExt};
 
-use crate::config::{Provider, WireName};
+use crate::config::{ProbeSource, Provider, WireName};
 use crate::store::ProviderStatus;
 
-/// Probe one provider, returning its fresh status. Lua probe when `probe_script`
-/// is set, otherwise a connectivity ping.
+/// Probe one provider, returning its fresh status. Lua probe when a script
+/// source is set, otherwise a connectivity ping.
 pub async fn run_probe(name: &str, provider: &Provider) -> ProviderStatus {
     let now = epoch_secs();
-    match &provider.probe_script {
-        Some(path) => {
-            let script = match tokio::fs::read_to_string(path).await {
-                Ok(s) => s,
+    let script: Option<String> = match provider.probe_source {
+        ProbeSource::Path => match &provider.probe_script {
+            Some(path) => match tokio::fs::read_to_string(path).await {
+                Ok(s) => Some(s),
                 Err(e) => return err_status(now, format!("read {path}: {e}")),
-            };
+            },
+            None => None,
+        },
+        ProbeSource::Text => provider.probe_script_text.clone(),
+    };
+
+    match script {
+        Some(script) => {
             let ctx = serde_json::json!({
                 "name": name,
                 "base_url": provider.base_url,
@@ -207,6 +214,8 @@ mod tests {
             max_tokens_field: "max_tokens".into(),
             extra_headers: HashMap::new(),
             probe_script: path,
+            probe_script_text: None,
+            probe_source: ProbeSource::Path,
             probe_enabled: None,
             probe_interval_secs: None,
             quota_min: None,

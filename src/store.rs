@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
-use crate::config::{Config, Provider, Route, WireName};
+use crate::config::{Config, ProbeSource, Provider, Route, WireName};
 
 /// Open (creating if missing) the SQLite database and run migrations.
 pub async fn open(path: &str) -> anyhow::Result<SqlitePool> {
@@ -45,9 +45,9 @@ pub async fn seed_from_config(pool: &SqlitePool, cfg: &Config) -> anyhow::Result
         sqlx::query(
             "INSERT INTO providers \
              (name, wire, base_url, api_key, model_prefix, max_tokens_field, extra_headers, \
-              probe_script, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
+              probe_script, probe_script_text, probe_source, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
               model_prices, usage) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(name.as_str())
         .bind(wire_to_str(p.wire))
@@ -57,6 +57,8 @@ pub async fn seed_from_config(pool: &SqlitePool, cfg: &Config) -> anyhow::Result
         .bind(p.max_tokens_field.as_str())
         .bind(serde_json::to_string(&p.extra_headers)?)
         .bind(p.probe_script.as_deref())
+        .bind(p.probe_script_text.as_deref())
+        .bind(probe_source_to_str(p.probe_source))
         .bind(p.probe_enabled.map(|b| b as i64))
         .bind(p.probe_interval_secs.map(|s| s as i64))
         .bind(p.quota_min)
@@ -126,6 +128,8 @@ fn row_to_provider(r: ProviderRow) -> anyhow::Result<Provider> {
         max_tokens_field: r.max_tokens_field,
         extra_headers,
         probe_script: r.probe_script,
+        probe_script_text: r.probe_script_text,
+        probe_source: str_to_probe_source(&r.probe_source),
         probe_enabled: r.probe_enabled.map(|b| b != 0),
         probe_interval_secs: r.probe_interval_secs.map(|s| s as u64),
         quota_min: r.quota_min,
@@ -138,7 +142,7 @@ fn row_to_provider(r: ProviderRow) -> anyhow::Result<Provider> {
 }
 
 const PROVIDER_COLS: &str = "name, wire, base_url, api_key, model_prefix, max_tokens_field, \
-     extra_headers, probe_script, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
+     extra_headers, probe_script, probe_script_text, probe_source, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
      model_prices, usage";
 
 /// Fetch one provider by name (used by the admin update path to read the stored
@@ -159,9 +163,9 @@ pub async fn insert_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
     sqlx::query(
         "INSERT INTO providers \
          (name, wire, base_url, api_key, model_prefix, max_tokens_field, extra_headers, \
-          probe_script, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
+          probe_script, probe_script_text, probe_source, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
           model_prices, usage) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(name)
     .bind(wire_to_str(p.wire))
@@ -171,6 +175,8 @@ pub async fn insert_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
     .bind(p.max_tokens_field.as_str())
     .bind(serde_json::to_string(&p.extra_headers)?)
     .bind(p.probe_script.as_deref())
+        .bind(p.probe_script_text.as_deref())
+        .bind(probe_source_to_str(p.probe_source))
     .bind(p.probe_enabled.map(|b| b as i64))
     .bind(p.probe_interval_secs.map(|s| s as i64))
     .bind(p.quota_min)
@@ -188,7 +194,7 @@ pub async fn update_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
     let res = sqlx::query(
         "UPDATE providers SET \
            wire = ?, base_url = ?, api_key = ?, model_prefix = ?, max_tokens_field = ?, \
-           extra_headers = ?, probe_script = ?, probe_enabled = ?, probe_interval_secs = ?, \
+           extra_headers = ?, probe_script = ?, probe_script_text = ?, probe_source = ?, probe_enabled = ?, probe_interval_secs = ?, \
            quota_min = ?, cost_windows = ?, model_prices = ?, usage = ? \
          WHERE name = ?",
     )
@@ -199,6 +205,8 @@ pub async fn update_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
     .bind(p.max_tokens_field.as_str())
     .bind(serde_json::to_string(&p.extra_headers)?)
     .bind(p.probe_script.as_deref())
+    .bind(p.probe_script_text.as_deref())
+        .bind(probe_source_to_str(p.probe_source))
     .bind(p.probe_enabled.map(|b| b as i64))
     .bind(p.probe_interval_secs.map(|s| s as i64))
     .bind(p.quota_min)
@@ -319,6 +327,8 @@ struct ProviderRow {
     extra_headers: String,
     probe_script: Option<String>,
     probe_enabled: Option<i64>,
+    probe_script_text: Option<String>,
+    probe_source: String,
     probe_interval_secs: Option<i64>,
     quota_min: Option<f64>,
     cost_windows: String,
@@ -340,6 +350,20 @@ fn wire_to_str(w: WireName) -> &'static str {
 
 fn str_to_wire(s: &str) -> anyhow::Result<WireName> {
     WireName::parse(s).ok_or_else(|| anyhow::anyhow!("unknown wire format in DB: {s}"))
+}
+
+fn probe_source_to_str(s: ProbeSource) -> &'static str {
+    match s {
+        ProbeSource::Path => "path",
+        ProbeSource::Text => "text",
+    }
+}
+
+fn str_to_probe_source(s: &str) -> ProbeSource {
+    match s {
+        "text" => ProbeSource::Text,
+        _ => ProbeSource::Path,
+    }
 }
 
 /// Runtime watcher state for one provider (written by the watcher; read by the
@@ -546,6 +570,8 @@ fallback = [{ provider = "zen", model = "gpt-5.5" }]
             max_tokens_field: "max_tokens".into(),
             extra_headers: HashMap::from([("x-foo".to_string(), "bar".to_string())]),
             probe_script: Some("probes/zen.lua".into()),
+            probe_script_text: None,
+            probe_source: ProbeSource::Path,
             probe_enabled: Some(true),
             probe_interval_secs: Some(60),
             quota_min: Some(1.5),
