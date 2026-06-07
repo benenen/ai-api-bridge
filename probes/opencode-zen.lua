@@ -1,22 +1,33 @@
 -- Availability + usage probe for OpenCode Zen / the "go" endpoint.
 --
 -- First tries GET /usage (rolling5h/weekly/monthly dollar usage). If the
--- endpoint doesn't exist yet (404), falls back to GET /models for a
--- connectivity check. When /usage goes live, the probe starts reporting
--- real quota numbers automatically.
+-- request fails (network error) or the endpoint returns non-200, falls back
+-- to GET /models for a connectivity check. When /usage goes live, the probe
+-- starts reporting real quota numbers automatically.
 --
 -- Context passed in: ctx = { name, base_url, api_key, extra_headers, wire }
 -- Return: { ok = bool, remaining?, used?, limit?, note? }
 
 local headers = { authorization = "Bearer " .. (ctx.api_key or "") }
 
--- Try /usage first.
-local resp = http {
-    url = ctx.base_url .. "/usage",
-    headers = headers,
-}
+-- Try /usage first, catching any network-level error (connection refused,
+-- timeout, DNS, TLS, etc.). On success but non-200, we still fall back.
+local usage_ok, usage_err
+local resp
+local ok, err = pcall(function()
+    resp = http {
+        url = ctx.base_url .. "/usage",
+        headers = headers,
+    }
+end)
+if ok then
+    usage_ok = resp.status == 200
+else
+    usage_ok = false
+    usage_err = err
+end
 
-if resp.status == 200 then
+if usage_ok then
     local body = json_decode(resp.body)
     local h5 = body.rolling5h or {}
     local wk = body.weekly or {}
@@ -33,12 +44,20 @@ if resp.status == 200 then
     return { ok = true, remaining = remaining, used = used, limit = limit, note = note }
 end
 
--- /usage not available (404 or other non-200) — fall back to /models ping.
+-- /usage not available (network error or non-200) — fall back to /models ping.
 local ping = http {
     url = ctx.base_url .. "/models",
     headers = headers,
 }
+
+local usage_note
+if usage_err then
+    usage_note = "GET /usage error: " .. tostring(usage_err)
+else
+    usage_note = "GET /usage -> " .. resp.status
+end
+
 return {
     ok = ping.status == 200,
-    note = "GET /usage -> " .. resp.status .. " (fallback /models -> " .. ping.status .. ")",
+    note = usage_note .. " (fallback /models -> " .. ping.status .. ")",
 }
