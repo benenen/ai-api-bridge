@@ -467,7 +467,10 @@
             </div>
             <div>
               <label>Upstream model</label>
-              <input name="model" placeholder="deepseek-v4-pro" />
+              <div class="ac-wrap">
+              <input name="model" placeholder="deepseek-v4-pro" autocomplete="off" id="modelInput" />
+              <div class="ac-list" id="modelList"></div>
+            </div>
             </div>
           </div>
           <div class="field">
@@ -718,6 +721,7 @@ async function loadAll() {
     state.providers = pr.providers || [];
     state.routes = ro.routes || [];
     state.costTracking = !!pr.cost_tracking;
+    buildModelProviderMap();
     syncUsageChip();
     renderProviders(); renderRoutes();
   } catch (e) {
@@ -732,6 +736,7 @@ async function refreshProviders() {
     const pr = await api("GET", "/admin/api/providers");
     state.providers = pr.providers || [];
     state.costTracking = !!pr.cost_tracking;
+    buildModelProviderMap();
     syncUsageChip();
     renderProviders();
   } catch (_) { /* silent on background refresh */ }
@@ -921,6 +926,112 @@ $("#probeScriptInput").addEventListener("blur", () => {
 document.addEventListener("click", (e) => {
   if (!e.target.closest("#probeScriptInput") && !e.target.closest("#probeScriptList")) {
     $("#probeScriptList").classList.remove("open");
+  }
+});
+
+
+/* ── upstream model autocomplete ─────────────────────────── */
+let modelProviderMap = {}; // provider name -> string[]
+
+function buildModelProviderMap() {
+  modelProviderMap = {};
+  (state.providers || []).forEach(p => {
+    modelProviderMap[p.name] = p.models || [];
+  });
+}
+
+function getModelsForProvider(provName) {
+  return modelProviderMap[provName] || [];
+}
+
+let modelFilter = "";
+let modelIdx = -1;
+
+function fuzzyModelMatch(pat, str) {
+  pat = pat.toLowerCase(); str = str.toLowerCase();
+  let pi = 0;
+  for (let si = 0; si < str.length && pi < pat.length; si++) {
+    if (str[si] === pat[pi]) pi++;
+  }
+  return pi === pat.length;
+}
+
+function renderModelList(filter, models) {
+  const list = $("#modelList");
+  list.innerHTML = "";
+  modelIdx = -1;
+  if (!filter || !models.length) { list.classList.remove("open"); return; }
+  const matches = models.filter(f => fuzzyModelMatch(filter, f)).slice(0, 15);
+  if (!matches.length) { list.classList.remove("open"); return; }
+  matches.forEach(f => {
+    const item = el("div", { class: "ac-item", text: "" });
+    item.innerHTML = highlightModelMatch(f, filter);
+    item.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      selectModel(f);
+    });
+    list.appendChild(item);
+  });
+  list.classList.add("open");
+}
+
+function highlightModelMatch(str, pat) {
+  if (!pat) return str;
+  const lower = str.toLowerCase(); const p = pat.toLowerCase();
+  let out = ""; let pi = 0;
+  for (let i = 0; i < str.length; i++) {
+    if (pi < p.length && lower[i] === p[pi]) {
+      out += '<span class="hl">' + str[i] + '</span>';
+      pi++;
+    } else out += str[i];
+  }
+  return out;
+}
+
+function selectModel(name) {
+  const inp = $("#modelInput");
+  inp.value = name;
+  $("#modelList").classList.remove("open");
+  modelIdx = -1;
+}
+
+$("#modelInput").addEventListener("input", () => {
+  const v = $("#modelInput").value;
+  modelFilter = v;
+  const prov = $("#routeProvider").value;
+  renderModelList(v, getModelsForProvider(prov));
+});
+$("#modelInput").addEventListener("keydown", (e) => {
+  const list = $("#modelList");
+  const items = list.querySelectorAll(".ac-item");
+  if (!list.classList.contains("open")) return;
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    modelIdx = Math.min(modelIdx + 1, items.length - 1);
+    items.forEach((it, i) => it.classList.toggle("active", i === modelIdx));
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    modelIdx = Math.max(modelIdx - 1, -1);
+    items.forEach((it, i) => it.classList.toggle("active", i === modelIdx));
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    if (modelIdx >= 0 && items[modelIdx]) {
+      selectModel(items[modelIdx].textContent);
+    }
+  } else if (e.key === "Escape") {
+    list.classList.remove("open");
+  }
+});
+$("#modelInput").addEventListener("blur", () => {
+  setTimeout(() => $("#modelList").classList.remove("open"), 150);
+});
+$("#routeProvider").addEventListener("change", () => {
+  $("#modelInput").value = "";
+  renderModelList($("#modelInput").value, getModelsForProvider($("#routeProvider").value));
+});
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#modelInput") && !e.target.closest("#modelList")) {
+    $("#modelList").classList.remove("open");
   }
 });
 

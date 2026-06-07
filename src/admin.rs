@@ -75,6 +75,8 @@ pub struct ProviderInput {
     pub model_prices: HashMap<String, ModelPrice>,
     #[serde(default)]
     pub usage: Vec<UsageSpec>,
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 /// Drop empty strings to `None` so blank form fields don't persist as `Some("")`.
@@ -121,6 +123,7 @@ impl ProviderInput {
             cost_windows: self.cost_windows,
             model_prices: self.model_prices,
             usage: self.usage,
+            models: self.models,
         };
         // Fold legacy cost_windows/model_prices into `usage` if the form sent them.
         provider.normalize_usage();
@@ -163,6 +166,7 @@ pub async fn list_providers(
                 "probe_script": p.probe_script,
                 "probe_script_text": p.probe_script_text,
                 "probe_source": match p.probe_source { ProbeSource::Path => "path", ProbeSource::Text => "text" },
+                "models": p.models,
                 "probe_enabled": p.probe_enabled(),
                 "probe_enabled_override": p.probe_enabled,
                 "probe_interval_secs": p.probe_interval_secs,

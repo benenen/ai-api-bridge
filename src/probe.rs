@@ -222,6 +222,7 @@ mod tests {
             cost_windows: Vec::new(),
             model_prices: HashMap::new(),
             usage: Vec::new(),
+            models: Vec::new(),
         }
     }
 

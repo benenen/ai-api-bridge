@@ -94,6 +94,9 @@ pub struct Provider {
     /// `cost_windows`/`model_prices` are folded into a `Billing` spec at load.
     #[serde(default)]
     pub usage: Vec<UsageSpec>,
+    /// Supported upstream model names (for autocomplete in the admin UI).
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 /// Pay-as-you-go price for one model, in dollars per 1M tokens.

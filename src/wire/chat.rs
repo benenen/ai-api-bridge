@@ -410,6 +410,7 @@ mod tests {
             cost_windows: Vec::new(),
             model_prices: std::collections::HashMap::new(),
             usage: Vec::new(),
+            models: Vec::new(),
         }
     }
 

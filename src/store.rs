@@ -46,8 +46,9 @@ pub async fn seed_from_config(pool: &SqlitePool, cfg: &Config) -> anyhow::Result
             "INSERT INTO providers \
              (name, wire, base_url, api_key, model_prefix, max_tokens_field, extra_headers, \
               probe_script, probe_script_text, probe_source, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
+              models, \
               model_prices, usage) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(name.as_str())
         .bind(wire_to_str(p.wire))
@@ -63,6 +64,7 @@ pub async fn seed_from_config(pool: &SqlitePool, cfg: &Config) -> anyhow::Result
         .bind(p.probe_interval_secs.map(|s| s as i64))
         .bind(p.quota_min)
         .bind(serde_json::to_string(&p.cost_windows)?)
+        .bind(serde_json::to_string(&p.models)?)
         .bind(serde_json::to_string(&p.model_prices)?)
         .bind(serde_json::to_string(&p.usage)?)
         .execute(&mut *tx)
@@ -134,6 +136,7 @@ fn row_to_provider(r: ProviderRow) -> anyhow::Result<Provider> {
         probe_interval_secs: r.probe_interval_secs.map(|s| s as u64),
         quota_min: r.quota_min,
         cost_windows: serde_json::from_str(&r.cost_windows).unwrap_or_default(),
+        models: serde_json::from_str(&r.models).unwrap_or_default(),
         model_prices: serde_json::from_str(&r.model_prices).unwrap_or_default(),
         usage: serde_json::from_str(&r.usage).unwrap_or_default(),
     };
@@ -143,6 +146,7 @@ fn row_to_provider(r: ProviderRow) -> anyhow::Result<Provider> {
 
 const PROVIDER_COLS: &str = "name, wire, base_url, api_key, model_prefix, max_tokens_field, \
      extra_headers, probe_script, probe_script_text, probe_source, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
+              models, \
      model_prices, usage";
 
 /// Fetch one provider by name (used by the admin update path to read the stored
@@ -164,8 +168,9 @@ pub async fn insert_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
         "INSERT INTO providers \
          (name, wire, base_url, api_key, model_prefix, max_tokens_field, extra_headers, \
           probe_script, probe_script_text, probe_source, probe_enabled, probe_interval_secs, quota_min, cost_windows, \
+              models, \
           model_prices, usage) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(name)
     .bind(wire_to_str(p.wire))
@@ -181,6 +186,7 @@ pub async fn insert_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
     .bind(p.probe_interval_secs.map(|s| s as i64))
     .bind(p.quota_min)
     .bind(serde_json::to_string(&p.cost_windows)?)
+        .bind(serde_json::to_string(&p.models)?)
     .bind(serde_json::to_string(&p.model_prices)?)
     .bind(serde_json::to_string(&p.usage)?)
     .execute(pool)
@@ -195,7 +201,7 @@ pub async fn update_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
         "UPDATE providers SET \
            wire = ?, base_url = ?, api_key = ?, model_prefix = ?, max_tokens_field = ?, \
            extra_headers = ?, probe_script = ?, probe_script_text = ?, probe_source = ?, probe_enabled = ?, probe_interval_secs = ?, \
-           quota_min = ?, cost_windows = ?, model_prices = ?, usage = ? \
+           quota_min = ?, cost_windows = ?, models = ?, model_prices = ?, usage = ? \
          WHERE name = ?",
     )
     .bind(wire_to_str(p.wire))
@@ -211,6 +217,7 @@ pub async fn update_provider(pool: &SqlitePool, name: &str, p: &Provider) -> any
     .bind(p.probe_interval_secs.map(|s| s as i64))
     .bind(p.quota_min)
     .bind(serde_json::to_string(&p.cost_windows)?)
+        .bind(serde_json::to_string(&p.models)?)
     .bind(serde_json::to_string(&p.model_prices)?)
     .bind(serde_json::to_string(&p.usage)?)
     .bind(name)
@@ -332,6 +339,7 @@ struct ProviderRow {
     probe_interval_secs: Option<i64>,
     quota_min: Option<f64>,
     cost_windows: String,
+    models: String,
     model_prices: String,
     usage: String,
 }
@@ -588,6 +596,7 @@ fallback = [{ provider = "zen", model = "gpt-5.5" }]
                 },
             )]),
             usage: Vec::new(),
+            models: Vec::new(),
         }
     }
 
