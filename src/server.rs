@@ -329,7 +329,7 @@ async fn responses_handler(
         };
         router::resolve_candidates(&cfg, &status, &exhausted, &req.model)?
     };
-    tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, "responses request");
+    tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, provider = %candidates[0].provider_name, "responses request");
 
     if req.stream {
         let (provider, model, byte_stream) =
@@ -655,7 +655,7 @@ async fn messages_handler(
         };
         router::resolve_candidates(&cfg, &status, &exhausted, &req.model)?
     };
-    tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, "messages request");
+    tracing::info!(model = %req.model, candidates = candidates.len(), stream = req.stream, provider = %candidates[0].provider_name, "messages request");
 
     if req.stream {
         let (provider, model, byte_stream) =
