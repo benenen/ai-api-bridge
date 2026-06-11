@@ -15,7 +15,9 @@ use axum::response::Html;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::{CostWindow, ModelPrice, ProbeSource, Provider, Route, RouteTarget, UsageSpec, WireName};
+use crate::config::{
+    CostWindow, ModelPrice, ProbeSource, Provider, Route, RouteTarget, UsageSpec, WireName,
+};
 use crate::error::BridgeError;
 use crate::server::{AppState, check_auth, now_secs, reload_from_db};
 use crate::store;
@@ -366,7 +368,75 @@ pub async fn list_routes(
         })
         .collect();
     routes.sort_by(|a, b| a["alias"].as_str().cmp(&b["alias"].as_str()));
-    Ok(Json(json!({ "routes": routes })))
+    Ok(Json(
+        json!({ "routes": routes, "fallback_route": cfg.fallback_route }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Global fallback route (safety net appended to every candidate chain)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct FallbackRouteInput {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// `GET /admin/api/fallback_route` — current global fallback route (or null).
+pub async fn get_fallback_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, BridgeError> {
+    let cfg = state.config();
+    check_auth(&cfg, &headers)?;
+    Ok(Json(json!({ "fallback_route": cfg.fallback_route })))
+}
+
+/// `PUT /admin/api/fallback_route` — set or clear (blank provider+model) the
+/// global fallback route. Persisted in the DB's `settings` table; a stored value
+/// (including an explicit clear) overrides `fallback_route` in the config file.
+pub async fn set_fallback_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<FallbackRouteInput>,
+) -> Result<Json<Value>, BridgeError> {
+    let cfg = state.config();
+    check_auth(&cfg, &headers)?;
+    let pool = pool(&state)?;
+
+    let provider = non_empty(input.provider);
+    let model = non_empty(input.model);
+    let target = match (provider, model) {
+        (None, None) => None, // both blank = clear
+        (Some(provider), Some(model)) => {
+            if !cfg.providers.contains_key(&provider) {
+                return Err(BridgeError::BadRequest(format!(
+                    "unknown provider: {provider}"
+                )));
+            }
+            Some(RouteTarget { provider, model })
+        }
+        _ => {
+            return Err(BridgeError::BadRequest(
+                "provider and model must both be set (or both blank to clear)".into(),
+            ));
+        }
+    };
+    store::save_fallback_route(pool, target.as_ref())
+        .await
+        .map_err(internal)?;
+    reload_from_db(&state).await?;
+    tracing::info!(
+        fallback = target
+            .as_ref()
+            .map(|t| format!("{}/{}", t.provider, t.model))
+            .unwrap_or_else(|| "cleared".into()),
+        "global fallback route updated via admin"
+    );
+    Ok(Json(json!({ "ok": true, "fallback_route": target })))
 }
 
 /// `POST /admin/api/routes` — create.
@@ -446,15 +516,15 @@ pub async fn list_probe_files(
 
     let mut files = Vec::new();
     let probes_dir = std::path::Path::new("probes");
-    if probes_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(probes_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map_or(false, |e| e == "lua") {
-                    if let Some(name) = path.to_str() {
-                        files.push(name.to_string());
-                    }
-                }
+    if probes_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(probes_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "lua")
+                && let Some(name) = path.to_str()
+            {
+                files.push(name.to_string());
             }
         }
     }

@@ -417,6 +417,46 @@ async fn reactive_failover_non_streaming_on_503() {
 }
 
 #[tokio::test]
+async fn global_fallback_route_backs_routes_and_catches_unrouted_aliases() {
+    let good = spawn(Router::new().route("/chat/completions", post(mock_chat_json))).await;
+    let bad = spawn(Router::new().route("/chat/completions", post(mock_503))).await;
+    // No default_provider; the route has no per-route fallback — only the global net.
+    let cfg = Config::from_toml(&format!(
+        "fallback_route = {{ provider = \"good\", model = \"deepseek-v4-pro\" }}\n\
+         [providers.bad]\nwire=\"openai-chat\"\nbase_url=\"{bad}\"\n\
+         [providers.good]\nwire=\"openai-chat\"\nbase_url=\"{good}\"\n\
+         [[routes]]\nalias=\"gpt-5.5\"\nprovider=\"bad\"\nmodel=\"x\""
+    ))
+    .unwrap();
+    let url = spawn(app(cfg)).await;
+    let client = reqwest::Client::new();
+
+    // Routed alias: primary 503s -> the global fallback serves the request.
+    let body: serde_json::Value = client
+        .post(format!("{url}/v1/responses"))
+        .json(&json!({"model": "gpt-5.5", "input": "hi", "stream": false}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "completed");
+
+    // Unrouted alias with no default_provider: caught by the global fallback.
+    let body: serde_json::Value = client
+        .post(format!("{url}/v1/responses"))
+        .json(&json!({"model": "no-such-alias", "input": "hi", "stream": false}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "completed");
+}
+
+#[tokio::test]
 async fn non_retryable_400_does_not_failover() {
     let good = spawn(Router::new().route("/chat/completions", post(mock_chat_json))).await;
     let bad = spawn(Router::new().route("/chat/completions", post(mock_400))).await;

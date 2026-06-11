@@ -18,24 +18,23 @@ pub struct Resolved<'a> {
 /// its `fallback` list (or the default provider) — reordered so watcher-usable
 /// providers come first. The caller tries them in order; reactive failure
 /// advances to the next. Degraded providers stay in the chain as a last resort.
+/// The global `fallback_route` (if configured) is appended as the final
+/// safety-net candidate of every chain, and alone catches aliases that match
+/// nothing else.
 pub fn resolve_candidates<'a>(
     cfg: &'a Config,
     status: &HashMap<String, ProviderStatus>,
     cost_exhausted: &HashSet<String>,
     alias: &str,
 ) -> Result<Vec<Resolved<'a>>, BridgeError> {
-    let raw: Vec<(String, String)> =
+    let mut raw: Vec<(String, String)> =
         if let Some(route) = cfg.routes.iter().find(|r| r.alias == alias) {
             let mut v = vec![(route.provider.clone(), route.model.clone())];
             for fb in &route.fallback {
                 v.push((fb.provider.clone(), fb.model.clone()));
             }
             v
-        } else {
-            let pname = cfg
-                .default_provider
-                .clone()
-                .ok_or_else(|| BridgeError::UnknownModel(alias.to_string()))?;
+        } else if let Some(pname) = cfg.default_provider.clone() {
             let provider = cfg.providers.get(&pname).ok_or_else(|| {
                 BridgeError::Internal(format!("default provider {pname} not configured"))
             })?;
@@ -44,7 +43,14 @@ pub fn resolve_candidates<'a>(
                 _ => alias.to_string(),
             };
             vec![(pname, model)]
+        } else {
+            Vec::new() // no route, no default — the global fallback_route may still catch it
         };
+    if let Some(fb) = &cfg.fallback_route
+        && !raw.iter().any(|(p, m)| *p == fb.provider && *m == fb.model)
+    {
+        raw.push((fb.provider.clone(), fb.model.clone()));
+    }
 
     let mut usable = Vec::new();
     let mut degraded = Vec::new();
@@ -214,6 +220,84 @@ fallback = [{ provider = "zen", model = "gpt-5.5" }]
         let cands = resolve_candidates(&c, &s, &HashSet::new(), "gpt-5.5").unwrap();
         assert_eq!(cands[0].provider_name, "go"); // primary tried first
         assert_eq!(cands[1].provider_name, "zen");
+    }
+
+    fn global_fallback_cfg() -> Config {
+        Config::from_toml(
+            r#"
+fallback_route = { provider = "safe", model = "gpt-5.5-mini" }
+[providers.go]
+wire = "openai-chat"
+base_url = "https://go"
+[providers.safe]
+wire = "openai-chat"
+base_url = "https://safe"
+[[routes]]
+alias = "gpt-5.5"
+provider = "go"
+model = "deepseek-v4-pro"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn global_fallback_appended_last_to_every_chain() {
+        let c = global_fallback_cfg();
+        let cands = resolve_candidates(&c, &no_status(), &HashSet::new(), "gpt-5.5").unwrap();
+        assert_eq!(cands.len(), 2);
+        assert_eq!(cands[0].provider_name, "go");
+        assert_eq!(cands[1].provider_name, "safe");
+        assert_eq!(cands[1].upstream_model, "gpt-5.5-mini");
+    }
+
+    #[test]
+    fn global_fallback_first_when_primary_unavailable() {
+        let mut s = HashMap::new();
+        s.insert("go".to_string(), status(false, None));
+        let c = global_fallback_cfg();
+        let cands = resolve_candidates(&c, &s, &HashSet::new(), "gpt-5.5").unwrap();
+        assert_eq!(cands[0].provider_name, "safe");
+        assert_eq!(cands[1].provider_name, "go"); // degraded primary kept as last resort
+    }
+
+    #[test]
+    fn global_fallback_catches_unrouted_alias_without_default() {
+        let c = global_fallback_cfg(); // no default_provider
+        let cands = resolve_candidates(&c, &no_status(), &HashSet::new(), "whatever").unwrap();
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].provider_name, "safe");
+        assert_eq!(cands[0].upstream_model, "gpt-5.5-mini");
+    }
+
+    #[test]
+    fn global_fallback_appended_after_default_provider() {
+        let mut c = global_fallback_cfg();
+        c.default_provider = Some("go".to_string());
+        let cands = resolve_candidates(&c, &no_status(), &HashSet::new(), "whatever").unwrap();
+        assert_eq!(cands.len(), 2);
+        assert_eq!(cands[0].provider_name, "go");
+        assert_eq!(cands[0].upstream_model, "whatever");
+        assert_eq!(cands[1].provider_name, "safe");
+    }
+
+    #[test]
+    fn global_fallback_not_duplicated_when_route_already_targets_it() {
+        let c = Config::from_toml(
+            r#"
+fallback_route = { provider = "safe", model = "gpt-5.5-mini" }
+[providers.safe]
+wire = "openai-chat"
+base_url = "https://safe"
+[[routes]]
+alias = "mini"
+provider = "safe"
+model = "gpt-5.5-mini"
+"#,
+        )
+        .unwrap();
+        let cands = resolve_candidates(&c, &no_status(), &HashSet::new(), "mini").unwrap();
+        assert_eq!(cands.len(), 1);
     }
 
     #[test]

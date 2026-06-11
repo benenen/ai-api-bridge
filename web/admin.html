@@ -352,6 +352,7 @@
         <button class="add" id="addRoute">+ NEW ROUTE</button>
       </div>
       <div class="grid" id="routes"><div class="loading">loading routes…</div></div>
+      <div class="grid" id="fallbackRoute" style="margin-top:12px"></div>
     </section>
   </main>
 
@@ -488,6 +489,37 @@
     </div>
   </div>
 
+  <!-- ── global fallback route modal ────────────────────────── -->
+  <div class="scrim" id="fbScrim">
+    <div class="modal" style="max-width: 520px;">
+      <h3><span class="tag">GLOBAL</span><span>Fallback route</span></h3>
+      <form id="fbForm" autocomplete="off">
+        <div class="body">
+          <div class="confirm-text" style="margin-bottom:14px; color:var(--dim); font-size:12px;">
+            Safety net appended as the <b>last candidate of every route</b> — serves a request
+            when everything else is down or failing, and catches unrouted model names.
+          </div>
+          <div class="field row2">
+            <div>
+              <label>Provider</label>
+              <select name="provider" id="fbProvider"></select>
+            </div>
+            <div>
+              <label>Upstream model</label>
+              <input name="model" placeholder="deepseek-v4-flash" id="fbModelInput" />
+            </div>
+          </div>
+          <div class="form-err" id="fbFormErr"></div>
+        </div>
+        <div class="foot">
+          <button type="button" class="btn danger" id="fbClear" style="margin-right:auto">Clear</button>
+          <button type="button" class="btn" data-close>Cancel</button>
+          <button type="submit" class="btn primary" id="fbSubmit">Save fallback</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- ── confirm modal ──────────────────────────────────────── -->
   <div class="scrim" id="confirmScrim">
     <div class="modal" style="max-width: 460px;">
@@ -559,6 +591,7 @@ const state = {
   token: localStorage.getItem(TOKEN_KEY) || "",
   providers: [],
   routes: [],
+  fallbackRoute: null,
   modalOpen: false,
   costTracking: false,
 };
@@ -710,8 +743,30 @@ function routeRow(r) {
 function renderRoutes() {
   $("#routeCount").textContent = "[ " + state.routes.length + " ]";
   const wrap = $("#routes");
-  if (!state.routes.length) { wrap.replaceChildren(emptyState("NO ROUTES", "Map an alias clients request to a provider + model.")); return; }
-  wrap.replaceChildren(...state.routes.map(routeRow));
+  if (!state.routes.length) { wrap.replaceChildren(emptyState("NO ROUTES", "Map an alias clients request to a provider + model.")); }
+  else wrap.replaceChildren(...state.routes.map(routeRow));
+  renderFallbackRoute();
+}
+
+/* ── render: global fallback route ─────────────────────────────── */
+function renderFallbackRoute() {
+  const fb = state.fallbackRoute;
+  const row = el("div", { class: "route" },
+    el("span", { class: "alias", text: "✻ fallback", title: "Global safety net — appended as the last candidate of every route; also catches unrouted model names." }),
+    el("span", { class: "arrow", text: "⤳" }),
+  );
+  if (fb) {
+    row.appendChild(el("span", { class: "target" },
+      el("span", { class: "prov", text: fb.provider }),
+      el("span", { class: "model", text: "/ " + fb.model }),
+    ));
+  } else {
+    row.appendChild(el("span", { class: "model", style: "color:var(--dimmer)", text: "not set — unrouted models 400 when no default provider" }));
+  }
+  row.appendChild(el("span", { class: "actions" },
+    el("button", { class: "icon-btn", dataset: { editFb: "1" }, text: fb ? "edit" : "set" }),
+  ));
+  $("#fallbackRoute").replaceChildren(row);
 }
 
 /* ── load ──────────────────────────────────────────────────────── */
@@ -720,6 +775,7 @@ async function loadAll() {
     const [pr, ro] = await Promise.all([api("GET", "/admin/api/providers"), api("GET", "/admin/api/routes")]);
     state.providers = pr.providers || [];
     state.routes = ro.routes || [];
+    state.fallbackRoute = ro.fallback_route || null;
     state.costTracking = !!pr.cost_tracking;
     buildModelProviderMap();
     syncUsageChip();
@@ -1163,6 +1219,39 @@ $("#routeForm").addEventListener("submit", async (e) => {
   } finally { $("#routeSubmit").disabled = false; }
 });
 
+/* ── global fallback route modal ───────────────────────────────── */
+function openFbModal() {
+  const f = $("#fbForm");
+  f.reset();
+  $("#fbFormErr").classList.remove("show");
+  const fb = state.fallbackRoute;
+  fillProviderSelect($("#fbProvider"), fb ? fb.provider : undefined);
+  $("#fbModelInput").value = fb ? fb.model : "";
+  openScrim("#fbScrim");
+}
+async function putFallbackRoute(body, okTitle, okMsg) {
+  const errEl = $("#fbFormErr");
+  errEl.classList.remove("show");
+  $("#fbSubmit").disabled = true; $("#fbClear").disabled = true;
+  try {
+    const r = await api("PUT", "/admin/api/fallback_route", body);
+    state.fallbackRoute = r.fallback_route || null;
+    closeScrims();
+    toast("ok", okTitle, okMsg);
+    await loadAll();
+  } catch (err) {
+    errEl.textContent = err.message; errEl.classList.add("show");
+  } finally { $("#fbSubmit").disabled = false; $("#fbClear").disabled = false; }
+}
+$("#fbForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const provider = $("#fbProvider").value;
+  const model = $("#fbModelInput").value.trim();
+  if (!model) { const errEl = $("#fbFormErr"); errEl.textContent = "Model is required (or use Clear)."; errEl.classList.add("show"); return; }
+  putFallbackRoute({ provider, model }, "Fallback route set", provider + "/" + model);
+});
+$("#fbClear").addEventListener("click", () => putFallbackRoute({}, "Fallback route cleared", ""));
+
 /* ── confirm / delete ──────────────────────────────────────────── */
 let pendingDelete = null;
 function openConfirm(kind, id) {
@@ -1245,6 +1334,10 @@ document.addEventListener("click", (e) => {
   else if (t.dataset && t.dataset.delProv) openConfirm("provider", t.dataset.delProv);
   else if (t.dataset && t.dataset.editRoute) openRouteModal(t.dataset.editRoute);
   else if (t.dataset && t.dataset.delRoute) openConfirm("route", t.dataset.delRoute);
+  else if (t.dataset && t.dataset.editFb) {
+    if (!state.providers.length) { toast("err", "Add a provider first", "The fallback route needs a provider to point at."); return; }
+    openFbModal();
+  }
 });
 
 /* ── boot ──────────────────────────────────────────────────────── */

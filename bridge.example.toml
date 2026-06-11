@@ -16,6 +16,11 @@ listen = "127.0.0.1:8282"
 # re-import from this file). listen/default_provider/auth_token are always read from here.
 database = "bridge.db"
 default_provider = "zen"
+# Global safety-net route: appended as the LAST candidate of every route's chain
+# (serves the request when everything else is down/exhausted/failing) and catches
+# unrouted model names when default_provider is unset. Seeds the DB on first run;
+# after that edit it on the admin page (or PUT /admin/api/fallback_route).
+# fallback_route = { provider = "go", model = "deepseek-v4-flash" }
 # Require clients to send the token: `Authorization: Bearer <auth_token>` (Codex's env_key)
 # or `x-api-key: <auth_token>` (Claude Code's ANTHROPIC_API_KEY). Unset = accept any/no token.
 # auth_token = "set-me-to-a-long-random-string"

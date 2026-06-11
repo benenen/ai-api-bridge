@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
-use crate::config::{Config, ProbeSource, Provider, Route, WireName};
+use crate::config::{Config, ProbeSource, Provider, Route, RouteTarget, WireName};
+
+/// `settings` key for the global fallback route (JSON `Option<RouteTarget>`).
+const FALLBACK_ROUTE_KEY: &str = "fallback_route";
 
 /// Open (creating if missing) the SQLite database and run migrations.
 pub async fn open(path: &str) -> anyhow::Result<SqlitePool> {
@@ -79,14 +82,28 @@ pub async fn seed_from_config(pool: &SqlitePool, cfg: &Config) -> anyhow::Result
             .execute(&mut *tx)
             .await?;
     }
+    // Seed the global fallback route only when the config sets one — an absent
+    // key keeps deferring to bridge.toml (see load_into_config).
+    if let Some(fb) = &cfg.fallback_route {
+        sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+            .bind(FALLBACK_ROUTE_KEY)
+            .bind(serde_json::to_string(&Some(fb))?)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
 
-/// Delete all providers + routes (used by `--reseed` before re-importing).
+/// Delete all providers + routes + the fallback-route setting (used by `--reseed`
+/// before re-importing).
 pub async fn clear(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM routes").execute(pool).await?;
     sqlx::query("DELETE FROM providers").execute(pool).await?;
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(FALLBACK_ROUTE_KEY)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -116,6 +133,35 @@ pub async fn load_into_config(pool: &SqlitePool, cfg: &mut Config) -> anyhow::Re
 
     cfg.providers = providers;
     cfg.routes = routes;
+    // A present settings key is authoritative (it may explicitly store `null` =
+    // cleared from the admin page); an absent key keeps the config-file value.
+    if let Some(fb) = load_fallback_route(pool).await? {
+        cfg.fallback_route = fb;
+    }
+    Ok(())
+}
+
+/// Read the stored fallback route. Outer `None` = key absent (defer to the config
+/// file); `Some(None)` = explicitly cleared; `Some(Some(_))` = set.
+pub async fn load_fallback_route(pool: &SqlitePool) -> anyhow::Result<Option<Option<RouteTarget>>> {
+    let raw: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(FALLBACK_ROUTE_KEY)
+        .fetch_optional(pool)
+        .await?;
+    Ok(raw.map(|v| serde_json::from_str(&v).unwrap_or_default()))
+}
+
+/// Persist the fallback route (`None` is stored as an explicit `null`, overriding
+/// any value in the config file until `--reseed`).
+pub async fn save_fallback_route(
+    pool: &SqlitePool,
+    fb: Option<&RouteTarget>,
+) -> anyhow::Result<()> {
+    sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+        .bind(FALLBACK_ROUTE_KEY)
+        .bind(serde_json::to_string(&fb)?)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -516,6 +562,74 @@ model = "deepseek-v4-pro"
         assert_eq!(loaded.routes[0].alias, "gpt-5.5");
         assert_eq!(loaded.routes[0].provider, "go");
         assert_eq!(loaded.routes[0].model, "deepseek-v4-pro");
+    }
+
+    #[tokio::test]
+    async fn fallback_route_seed_save_clear_roundtrip() {
+        let cfg = Config::from_toml(
+            r#"
+fallback_route = { provider = "zen", model = "gpt-5.5-mini" }
+[providers.zen]
+wire = "openai-chat"
+base_url = "https://zen"
+"#,
+        )
+        .unwrap();
+        let pool = temp_pool().await;
+        seed_from_config(&pool, &cfg).await.unwrap();
+
+        // seeded value loads into a blank config
+        let mut loaded = Config::from_toml("").unwrap();
+        load_into_config(&pool, &mut loaded).await.unwrap();
+        let fb = loaded.fallback_route.as_ref().unwrap();
+        assert_eq!(fb.provider, "zen");
+        assert_eq!(fb.model, "gpt-5.5-mini");
+
+        // admin update overwrites
+        save_fallback_route(
+            &pool,
+            Some(&RouteTarget {
+                provider: "zen".into(),
+                model: "glm-5".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut loaded = Config::from_toml("").unwrap();
+        load_into_config(&pool, &mut loaded).await.unwrap();
+        assert_eq!(loaded.fallback_route.as_ref().unwrap().model, "glm-5");
+
+        // explicit clear stores `null`, overriding the config-file value
+        save_fallback_route(&pool, None).await.unwrap();
+        let mut loaded = cfg.clone(); // file still says zen/gpt-5.5-mini
+        load_into_config(&pool, &mut loaded).await.unwrap();
+        assert!(loaded.fallback_route.is_none());
+
+        // --reseed clears the key -> config file value applies again
+        clear(&pool).await.unwrap();
+        assert!(load_fallback_route(&pool).await.unwrap().is_none());
+        let mut loaded = cfg.clone();
+        load_into_config(&pool, &mut loaded).await.unwrap();
+        assert_eq!(loaded.fallback_route.as_ref().unwrap().provider, "zen");
+    }
+
+    #[tokio::test]
+    async fn absent_fallback_key_keeps_config_value() {
+        let pool = temp_pool().await;
+        let cfg =
+            Config::from_toml("[providers.zen]\nwire=\"openai-chat\"\nbase_url=\"u\"").unwrap();
+        seed_from_config(&pool, &cfg).await.unwrap(); // no fallback_route -> no key seeded
+
+        let mut loaded = Config::from_toml(
+            r#"fallback_route = { provider = "zen", model = "m" }
+[providers.zen]
+wire = "openai-chat"
+base_url = "u"
+"#,
+        )
+        .unwrap();
+        load_into_config(&pool, &mut loaded).await.unwrap();
+        assert!(loaded.fallback_route.is_some(), "file value should survive");
     }
 
     #[tokio::test]

@@ -24,6 +24,11 @@ pub struct Config {
     pub providers: HashMap<String, Provider>,
     #[serde(default)]
     pub routes: Vec<Route>,
+    /// Global safety-net target, appended as the last candidate of every resolved
+    /// chain (and catching aliases that match no route when `default_provider` is
+    /// unset). Like `listen`/`default_provider`, always read from the config file.
+    #[serde(default)]
+    pub fallback_route: Option<RouteTarget>,
 }
 
 fn default_listen() -> String {
@@ -35,17 +40,12 @@ fn default_database() -> String {
 }
 
 /// Whether a probe script is a file path or inline text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeSource {
+    #[default]
     Path,
     Text,
-}
-
-impl Default for ProbeSource {
-    fn default() -> Self {
-        ProbeSource::Path
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -375,5 +375,22 @@ model = "opencode/gpt-5.5"
     fn listen_defaults() {
         let cfg = Config::from_toml("").unwrap();
         assert_eq!(cfg.listen, "127.0.0.1:8282");
+        assert!(cfg.fallback_route.is_none());
+    }
+
+    #[test]
+    fn parses_fallback_route() {
+        let cfg = Config::from_toml(
+            r#"
+fallback_route = { provider = "zen", model = "gpt-5.5-mini" }
+[providers.zen]
+wire = "openai-chat"
+base_url = "https://opencode.ai/zen/v1"
+"#,
+        )
+        .unwrap();
+        let fb = cfg.fallback_route.unwrap();
+        assert_eq!(fb.provider, "zen");
+        assert_eq!(fb.model, "gpt-5.5-mini");
     }
 }

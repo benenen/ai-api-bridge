@@ -22,6 +22,9 @@ backs both. Purpose: use an OpenCode Zen account inside both Codex and Claude Co
 - One test: `cargo test wire::responses::tests::emits_message_sequence_for_text`
 - One module: `cargo test wire::chat::tests`
 - Verbose logs: `RUST_LOG=ai_api_bridge=debug cargo run -- --config bridge.toml`
+- **Before every push, run the CI lint checks locally**:
+  `cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings`
+  (CI fails the build on either; run `cargo fmt --all` to fix formatting).
 - Cross-compile (Linux musl): `cross build --release --target x86_64-unknown-linux-musl`
 - Cross-compile (ARM64): `cross build --release --target aarch64-unknown-linux-musl`
 
@@ -57,13 +60,17 @@ wire-format directly:
 - `router.rs` — explicit `[[routes]]` win; otherwise the default provider's `model_prefix`
   is applied (`gpt-5.5` -> `opencode/gpt-5.5`) unless the alias already contains `/`.
   `resolve_candidates` returns the **ordered candidate chain** (route primary + `fallback`,
-  watcher-usable first) for failover. The server's `open_upstream_stream`/`call_upstream_json`
+  watcher-usable first) for failover. The global `fallback_route` (config key /
+  `settings` DB row, editable on the admin page) is appended as the last candidate of
+  every chain and alone catches unrouted aliases when `default_provider` is unset. The server's `open_upstream_stream`/`call_upstream_json`
   try them in order and **reactively** advance on a call-time failure (`is_retryable`:
   connect/timeout, 5xx, 429, 401/402 — not other 4xx); for streaming the retry happens before
   the first byte (headers known first). A reactive failure marks the provider down (+ one-shot
   re-probe via `mark_degraded`). `upstream::ByteStream` is the boxed stream the helpers return.
 - `upstream.rs` — reqwest client; `post_stream` (SSE) and `post_json` (non-stream).
-- `store.rs` — SQLite (sqlx, runtime queries) for providers + routes + `provider_status`.
+- `store.rs` — SQLite (sqlx, runtime queries) for providers + routes + `provider_status` +
+  `settings` (key-value; holds `fallback_route` — a present key, even an explicit `null`,
+  overrides the config file; `--reseed` deletes it).
   `bridge.toml` seeds an empty DB once (`seed_from_config`), then the DB is authoritative;
   `main` runs `open` → seed-if-`is_empty` → `load_into_config` → `apply_env_overrides` at
   startup (no per-request DB hit). The pool **stays alive** for the watcher's writes.
@@ -84,6 +91,7 @@ wire-format directly:
   embedded management page (`web/admin.html`, `include_str!`). CRUD over the SQLite-backed
   config: `GET/POST /admin/api/providers`, `PUT/DELETE /admin/api/providers/:name`,
   `GET/POST /admin/api/routes`, `PUT/DELETE /admin/api/routes/:alias`,
+  `GET/PUT /admin/api/fallback_route` (global safety-net route; blank provider+model clears),
   `GET/POST /admin/api/usage` (cost-tracking toggle). List masks `api_key`
   (`api_key_set`); update preserves the stored key when the field is blank. Every write runs
   `server::reload_from_db` — rebuilds the `Config` snapshot, reconciles the watcher

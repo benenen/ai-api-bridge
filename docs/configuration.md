@@ -46,6 +46,9 @@ they live in a SQLite database (`bridge.db` by default; set `database` or `--db`
   supplied only via env is never persisted to the DB.
 - The other top-level keys (`listen`, `default_provider`, `auth_token`, `database`) are
   always read from `bridge.toml`, never the DB.
+- `fallback_route` follows the providers/routes model: seeded from `bridge.toml`, then the
+  DB (`settings` table) is authoritative — edit it on the admin page or via
+  `PUT /admin/api/fallback_route`. While no DB value exists, the config-file value applies.
 
 `bridge.db` holds provider API keys, so it is gitignored like `bridge.toml`.
 
@@ -55,7 +58,8 @@ they live in a SQLite database (`bridge.db` by default; set `database` or `--db`
 |---|---|---|---|
 | `listen` | string | `127.0.0.1:8282` | Address the bridge binds to. |
 | `database` | string | `bridge.db` | SQLite file holding providers + routes (see [Provider store](#provider-store-sqlite)). Override with `--db`. |
-| `default_provider` | string | — | Provider used when no `[[routes]]` entry matches. Optional, but without it any unrouted model name is a 400. |
+| `default_provider` | string | — | Provider used when no `[[routes]]` entry matches. Optional, but without it (and without `fallback_route`) any unrouted model name is a 400. |
+| `fallback_route` | `{ provider, model }` | — | Global safety-net target. Appended as the **last candidate of every route's chain** (so it serves a request when everything else is down/exhausted/failing) and catches unrouted model names when `default_provider` is unset. Seeds the DB on first run; thereafter editable on the admin page / `PUT /admin/api/fallback_route`. |
 | `auth_token` | string | — | If set, clients must send the token as `Authorization: Bearer <token>` or `x-api-key: <token>` (Claude Code). If unset, any/no token is accepted. Also gates the admin API. |
 | `cost_tracking` | bool | `false` | Master switch for [usage tracking](#usage-tracking-cost--count--token-windows). Off = no usage recorded/exposed and no usage-based failover, at zero overhead (429 failover is unaffected). Toggle at runtime on the admin page / `POST /admin/api/usage`. |
 | `[providers.<name>]` | table | — | Upstream providers — **seed the SQLite store** on first run (see above). |
@@ -64,6 +68,7 @@ they live in a SQLite database (`bridge.db` by default; set `database` or `--db`
 ```toml
 listen = "127.0.0.1:8282"
 default_provider = "zen"
+fallback_route = { provider = "zen", model = "gpt-5.5-mini" }   # optional safety net
 auth_token = "a-long-random-string"   # optional
 ```
 
@@ -169,7 +174,10 @@ model = "deepseek-v4-flash"
    `provider` + `model`.
 2. Otherwise → use `default_provider`; the upstream model is the requested name with the
    provider's `model_prefix` applied (only if the name has no `/`).
-3. If neither applies (no route, no default) → `400 unknown model`.
+3. In every case, a configured `fallback_route` is appended as the **final candidate** of
+   the chain (skipped if the chain already contains that exact provider+model) — so it both
+   backs up every route and catches unrouted names when `default_provider` is unset.
+4. If nothing applies (no route, no default, no `fallback_route`) → `400 unknown model`.
 
 This means you can switch which upstream model backs Codex by editing a route's `model`,
 without touching Codex itself.
@@ -215,7 +223,8 @@ periodic and out-of-band — it never adds latency to a request.
 ### Failover (proactive + reactive)
 
 A request resolves to a **candidate chain** — the route's primary then its `fallback` list
-(in order) — reordered so watcher-usable providers come first. Two layers then apply:
+(in order), then the global `fallback_route` (if configured) — reordered so watcher-usable
+providers come first. Two layers then apply:
 
 - **Proactive** (watcher status): a candidate is ranked last when its status is
   `available = false`, or `quota_remaining` is known and below the provider's `quota_min`.
@@ -308,8 +317,9 @@ prompts for it once and keeps it in browser `localStorage`). Backing REST API:
 |---|---|
 | `GET/POST /admin/api/providers` | List (api_key masked) / create a provider. |
 | `PUT/DELETE /admin/api/providers/:name` | Update (blank `api_key` keeps the stored one) / delete (cascades its routes). |
-| `GET/POST /admin/api/routes` | List / create a route. |
+| `GET/POST /admin/api/routes` | List / create a route (the list also carries `fallback_route`). |
 | `PUT/DELETE /admin/api/routes/:alias` | Update / delete a route. |
+| `GET/PUT /admin/api/fallback_route` | Read / set the global fallback route (`{provider, model}`; blank both to clear). |
 | `GET/POST /admin/api/usage` | Read / set the usage-tracking on-off switch (runtime; the persistent default is `cost_tracking`). |
 
 Every write rebuilds the live config and restarts the watcher in place — **no process restart**.
@@ -363,6 +373,7 @@ across turns.
 | `GET /health` | Liveness check (returns `ok`). |
 | `GET /` · `GET /admin` | [Admin web UI](#admin-web-ui) (dashboard). |
 | `/admin/api/providers[/:name]` · `/admin/api/routes[/:alias]` | Provider/route CRUD (reuse `auth_token`). |
+| `GET/PUT /admin/api/fallback_route` | Global fallback route (safety net). |
 | `GET/POST /admin/api/usage` | Usage-tracking on/off toggle. |
 
 ## Full example

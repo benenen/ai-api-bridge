@@ -189,7 +189,8 @@ pub(crate) async fn reload_from_db(state: &AppState) -> Result<(), BridgeError> 
         return Err(BridgeError::Internal("no database handle".into()));
     };
     // Keep process-level fields (listen/database/default_provider/auth_token) from
-    // the current snapshot; only providers + routes are reloaded from the DB.
+    // the current snapshot; providers + routes + the fallback-route setting are
+    // reloaded from the DB.
     let mut cfg = (*state.config()).clone();
     store::load_into_config(pool, &mut cfg)
         .await
@@ -238,15 +239,17 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             "/admin/api/routes/:alias",
             put(admin::update_route).delete(admin::delete_route),
         )
+        // Global fallback route (safety net appended to every candidate chain).
+        .route(
+            "/admin/api/fallback_route",
+            get(admin::get_fallback_route).put(admin::set_fallback_route),
+        )
         // Cost/usage tracking master switch.
         .route(
             "/admin/api/usage",
-            get(admin::get_usage).post(admin::set_usage)
+            get(admin::get_usage).post(admin::set_usage),
         )
-        .route(
-            "/admin/api/probes",
-            get(admin::list_probe_files),
-        )
+        .route("/admin/api/probes", get(admin::list_probe_files))
         .with_state(state)
 }
 
