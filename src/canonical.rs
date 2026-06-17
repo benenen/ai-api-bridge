@@ -122,6 +122,11 @@ pub enum CanonicalEvent {
         /// Responses `input_tokens_details.cached_tokens` / Anthropic
         /// `cache_read_input_tokens`.
         cached_input_tokens: u32,
+        /// Output tokens spent on reasoning (reasoning models). A subset of
+        /// `output_tokens`; surfaced as Responses
+        /// `output_tokens_details.reasoning_tokens`. Anthropic has no equivalent
+        /// field, so it stays folded into `output_tokens` there.
+        reasoning_tokens: u32,
     },
     Completed,
     Error {

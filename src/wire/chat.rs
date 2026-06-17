@@ -385,6 +385,12 @@ fn usage_event(u: &Value) -> CanonicalEvent {
         .and_then(|v| v.as_u64())
         .or_else(|| u.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64()))
         .unwrap_or(0) as u32;
+    // Reasoning tokens (reasoning models): a subset of completion_tokens.
+    let reasoning_tokens = u
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
     CanonicalEvent::Usage {
         input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         output_tokens: u
@@ -393,6 +399,7 @@ fn usage_event(u: &Value) -> CanonicalEvent {
             .unwrap_or(0) as u32,
         total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         cached_input_tokens,
+        reasoning_tokens,
     }
 }
 
@@ -507,7 +514,8 @@ mod tests {
         evs.extend(p.on_chunk(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})));
         evs.extend(p.on_chunk(&json!({"choices":[],
             "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,
-                     "prompt_tokens_details":{"cached_tokens":1}}})));
+                     "prompt_tokens_details":{"cached_tokens":1},
+                     "completion_tokens_details":{"reasoning_tokens":1}}})));
         use CanonicalEvent::*;
         assert_eq!(
             evs[0],
@@ -524,7 +532,8 @@ mod tests {
                 input_tokens: 3,
                 output_tokens: 2,
                 total_tokens: 5,
-                cached_input_tokens: 1
+                cached_input_tokens: 1,
+                reasoning_tokens: 1
             }
         );
     }

@@ -269,7 +269,8 @@ pub struct AnthropicEmitter {
     text_text: String,
     tools: BTreeMap<u32, ToolBlock>,
     any_tool: bool,
-    usage: Option<(u32, u32, u32, u32)>,
+    /// (input_tokens, output_tokens, total_tokens, cached_input_tokens, reasoning_tokens)
+    usage: Option<(u32, u32, u32, u32, u32)>,
     final_blocks: Vec<Value>,
 }
 
@@ -368,12 +369,14 @@ impl AnthropicEmitter {
                 output_tokens,
                 total_tokens,
                 cached_input_tokens,
+                reasoning_tokens,
             } => {
                 self.usage = Some((
                     *input_tokens,
                     *output_tokens,
                     *total_tokens,
                     *cached_input_tokens,
+                    *reasoning_tokens,
                 ));
             }
             CanonicalEvent::Completed => {
@@ -436,7 +439,9 @@ impl AnthropicEmitter {
     /// Anthropic `input_tokens` is the non-cached remainder and the cached
     /// portion is reported separately as `cache_read_input_tokens`.
     fn anthropic_usage(&self) -> (u32, u32, u32) {
-        let (input, output, _total, cached) = self.usage.unwrap_or((0, 0, 0, 0));
+        // reasoning_tokens (5th) stays folded into output_tokens — Anthropic has
+        // no separate field for it.
+        let (input, output, _total, cached, _reasoning) = self.usage.unwrap_or((0, 0, 0, 0, 0));
         (input.saturating_sub(cached), output, cached)
     }
 
@@ -665,6 +670,7 @@ mod tests {
             output_tokens: 1,
             total_tokens: 4,
             cached_input_tokens: 2,
+            reasoning_tokens: 0,
         }));
         f.extend(e.on_event(&Completed));
         let n = names(&f);
@@ -751,6 +757,7 @@ mod tests {
                 output_tokens: 2,
                 total_tokens: 7,
                 cached_input_tokens: 2,
+                reasoning_tokens: 0,
             },
             Completed,
         ] {

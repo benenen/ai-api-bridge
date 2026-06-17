@@ -268,7 +268,8 @@ pub struct ResponsesEmitter {
     message_item: Option<OpenItem>,
     message_text: String,
     tools: std::collections::BTreeMap<u32, ToolItem>,
-    usage: Option<(u32, u32, u32, u32)>,
+    /// (input_tokens, output_tokens, total_tokens, cached_input_tokens, reasoning_tokens)
+    usage: Option<(u32, u32, u32, u32, u32)>,
     final_items: Vec<Value>,
     seq: u64,
 }
@@ -376,12 +377,14 @@ impl ResponsesEmitter {
                 output_tokens,
                 total_tokens,
                 cached_input_tokens,
+                reasoning_tokens,
             } => {
                 self.usage = Some((
                     *input_tokens,
                     *output_tokens,
                     *total_tokens,
                     *cached_input_tokens,
+                    *reasoning_tokens,
                 ));
             }
             CanonicalEvent::Completed => {
@@ -547,11 +550,12 @@ impl ResponsesEmitter {
     }
 
     fn completed_response(&self) -> Value {
-        let (i, o, t, c) = self.usage.unwrap_or((0, 0, 0, 0));
+        let (i, o, t, c, r) = self.usage.unwrap_or((0, 0, 0, 0, 0));
         json!({"id": self.response_id, "object": "response", "status": "completed",
             "model": self.model, "output": self.final_items,
             "usage": {"input_tokens": i, "input_tokens_details": {"cached_tokens": c},
-                      "output_tokens": o, "total_tokens": t}})
+                      "output_tokens": o, "output_tokens_details": {"reasoning_tokens": r},
+                      "total_tokens": t}})
     }
 }
 
@@ -726,9 +730,10 @@ mod tests {
         frames.extend(e.on_event(&TextDelta { text: "Hi".into() }));
         frames.extend(e.on_event(&Usage {
             input_tokens: 10,
-            output_tokens: 1,
-            total_tokens: 11,
+            output_tokens: 5,
+            total_tokens: 15,
             cached_input_tokens: 7,
+            reasoning_tokens: 3,
         }));
         frames.extend(e.on_event(&Completed));
         let names = event_names(&frames);
@@ -743,10 +748,14 @@ mod tests {
             .unwrap();
         assert_eq!(delta.data["delta"], "Hi");
         let completed = frames.last().unwrap();
-        assert_eq!(completed.data["response"]["usage"]["total_tokens"], 11);
+        assert_eq!(completed.data["response"]["usage"]["total_tokens"], 15);
         assert_eq!(
             completed.data["response"]["usage"]["input_tokens_details"]["cached_tokens"],
             7
+        );
+        assert_eq!(
+            completed.data["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+            3
         );
         assert_eq!(
             completed.data["response"]["output"][0]["content"][0]["text"],
