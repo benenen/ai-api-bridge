@@ -268,7 +268,7 @@ pub struct ResponsesEmitter {
     message_item: Option<OpenItem>,
     message_text: String,
     tools: std::collections::BTreeMap<u32, ToolItem>,
-    usage: Option<(u32, u32, u32)>,
+    usage: Option<(u32, u32, u32, u32)>,
     final_items: Vec<Value>,
     seq: u64,
 }
@@ -375,8 +375,14 @@ impl ResponsesEmitter {
                 input_tokens,
                 output_tokens,
                 total_tokens,
+                cached_input_tokens,
             } => {
-                self.usage = Some((*input_tokens, *output_tokens, *total_tokens));
+                self.usage = Some((
+                    *input_tokens,
+                    *output_tokens,
+                    *total_tokens,
+                    *cached_input_tokens,
+                ));
             }
             CanonicalEvent::Completed => {
                 self.close_reasoning(&mut f);
@@ -541,10 +547,11 @@ impl ResponsesEmitter {
     }
 
     fn completed_response(&self) -> Value {
-        let (i, o, t) = self.usage.unwrap_or((0, 0, 0));
+        let (i, o, t, c) = self.usage.unwrap_or((0, 0, 0, 0));
         json!({"id": self.response_id, "object": "response", "status": "completed",
             "model": self.model, "output": self.final_items,
-            "usage": {"input_tokens": i, "output_tokens": o, "total_tokens": t}})
+            "usage": {"input_tokens": i, "input_tokens_details": {"cached_tokens": c},
+                      "output_tokens": o, "total_tokens": t}})
     }
 }
 
@@ -718,9 +725,10 @@ mod tests {
         }));
         frames.extend(e.on_event(&TextDelta { text: "Hi".into() }));
         frames.extend(e.on_event(&Usage {
-            input_tokens: 1,
+            input_tokens: 10,
             output_tokens: 1,
-            total_tokens: 2,
+            total_tokens: 11,
+            cached_input_tokens: 7,
         }));
         frames.extend(e.on_event(&Completed));
         let names = event_names(&frames);
@@ -735,7 +743,11 @@ mod tests {
             .unwrap();
         assert_eq!(delta.data["delta"], "Hi");
         let completed = frames.last().unwrap();
-        assert_eq!(completed.data["response"]["usage"]["total_tokens"], 2);
+        assert_eq!(completed.data["response"]["usage"]["total_tokens"], 11);
+        assert_eq!(
+            completed.data["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            7
+        );
         assert_eq!(
             completed.data["response"]["output"][0]["content"][0]["text"],
             "Hi"

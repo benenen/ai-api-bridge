@@ -117,6 +117,11 @@ pub enum CanonicalEvent {
         input_tokens: u32,
         output_tokens: u32,
         total_tokens: u32,
+        /// Prompt tokens served from the upstream prefix cache. For OpenAI-style
+        /// usage this is a subset of `input_tokens`; surfaced to clients as
+        /// Responses `input_tokens_details.cached_tokens` / Anthropic
+        /// `cache_read_input_tokens`.
+        cached_input_tokens: u32,
     },
     Completed,
     Error {

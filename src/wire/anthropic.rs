@@ -269,7 +269,7 @@ pub struct AnthropicEmitter {
     text_text: String,
     tools: BTreeMap<u32, ToolBlock>,
     any_tool: bool,
-    usage: Option<(u32, u32, u32)>,
+    usage: Option<(u32, u32, u32, u32)>,
     final_blocks: Vec<Value>,
 }
 
@@ -367,14 +367,20 @@ impl AnthropicEmitter {
                 input_tokens,
                 output_tokens,
                 total_tokens,
+                cached_input_tokens,
             } => {
-                self.usage = Some((*input_tokens, *output_tokens, *total_tokens));
+                self.usage = Some((
+                    *input_tokens,
+                    *output_tokens,
+                    *total_tokens,
+                    *cached_input_tokens,
+                ));
             }
             CanonicalEvent::Completed => {
                 self.close_thinking(&mut f);
                 self.close_text(&mut f);
                 self.close_open_tools(&mut f);
-                let (i, o, _) = self.usage.unwrap_or((0, 0, 0));
+                let (uncached, o, cache_read) = self.anthropic_usage();
                 let stop_reason = if self.any_tool {
                     "tool_use"
                 } else {
@@ -385,7 +391,8 @@ impl AnthropicEmitter {
                     json!({
                         "type": "message_delta",
                         "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                        "usage": {"input_tokens": i, "output_tokens": o}
+                        "usage": {"input_tokens": uncached, "output_tokens": o,
+                                  "cache_read_input_tokens": cache_read}
                     }),
                 ));
                 f.push(frame("message_stop", json!({"type": "message_stop"})));
@@ -405,7 +412,7 @@ impl AnthropicEmitter {
 
     /// The full non-streaming Messages object (valid after `Completed`).
     pub fn final_message(&self) -> Value {
-        let (i, o, _) = self.usage.unwrap_or((0, 0, 0));
+        let (uncached, o, cache_read) = self.anthropic_usage();
         let stop_reason = if self.any_tool {
             "tool_use"
         } else {
@@ -419,8 +426,18 @@ impl AnthropicEmitter {
             "content": self.final_blocks,
             "stop_reason": stop_reason,
             "stop_sequence": null,
-            "usage": {"input_tokens": i, "output_tokens": o}
+            "usage": {"input_tokens": uncached, "output_tokens": o,
+                      "cache_read_input_tokens": cache_read}
         })
+    }
+
+    /// `(input_tokens, output_tokens, cache_read_input_tokens)` in Anthropic
+    /// terms: upstream `prompt_tokens` is cache-hit + cache-miss, so the
+    /// Anthropic `input_tokens` is the non-cached remainder and the cached
+    /// portion is reported separately as `cache_read_input_tokens`.
+    fn anthropic_usage(&self) -> (u32, u32, u32) {
+        let (input, output, _total, cached) = self.usage.unwrap_or((0, 0, 0, 0));
+        (input.saturating_sub(cached), output, cached)
     }
 
     fn start(&mut self, f: &mut Vec<SseFrame>) {
@@ -647,6 +664,7 @@ mod tests {
             input_tokens: 3,
             output_tokens: 1,
             total_tokens: 4,
+            cached_input_tokens: 2,
         }));
         f.extend(e.on_event(&Completed));
         let n = names(&f);
@@ -664,6 +682,9 @@ mod tests {
         let md = f.iter().find(|fr| fr.event == "message_delta").unwrap();
         assert_eq!(md.data["delta"]["stop_reason"], "end_turn");
         assert_eq!(md.data["usage"]["output_tokens"], 1);
+        // Anthropic input_tokens excludes the cache-read portion (3 - 2 = 1).
+        assert_eq!(md.data["usage"]["input_tokens"], 1);
+        assert_eq!(md.data["usage"]["cache_read_input_tokens"], 2);
     }
 
     #[test]
@@ -729,6 +750,7 @@ mod tests {
                 input_tokens: 5,
                 output_tokens: 2,
                 total_tokens: 7,
+                cached_input_tokens: 2,
             },
             Completed,
         ] {
@@ -744,6 +766,8 @@ mod tests {
         assert_eq!(msg["content"][2]["type"], "tool_use");
         assert_eq!(msg["content"][2]["name"], "f");
         assert_eq!(msg["stop_reason"], "tool_use");
-        assert_eq!(msg["usage"]["input_tokens"], 5);
+        // input_tokens (5) minus cache-read (2) = 3; cached reported separately.
+        assert_eq!(msg["usage"]["input_tokens"], 3);
+        assert_eq!(msg["usage"]["cache_read_input_tokens"], 2);
     }
 }

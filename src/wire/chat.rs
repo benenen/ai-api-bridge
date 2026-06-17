@@ -376,6 +376,15 @@ pub fn completion_to_events(resp: &Value, response_id: &str) -> Vec<CanonicalEve
 }
 
 fn usage_event(u: &Value) -> CanonicalEvent {
+    // Prefix-cache hits: OpenAI exposes `prompt_tokens_details.cached_tokens`;
+    // DeepSeek also reports `prompt_cache_hit_tokens`. Prefer the former, fall
+    // back to the latter so both upstream dialects pass through.
+    let cached_input_tokens = u
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| u.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64()))
+        .unwrap_or(0) as u32;
     CanonicalEvent::Usage {
         input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         output_tokens: u
@@ -383,6 +392,7 @@ fn usage_event(u: &Value) -> CanonicalEvent {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32,
         total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        cached_input_tokens,
     }
 }
 
@@ -496,7 +506,8 @@ mod tests {
         evs.extend(p.on_chunk(&json!({"choices":[{"delta":{"content":"lo"}}]})));
         evs.extend(p.on_chunk(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]})));
         evs.extend(p.on_chunk(&json!({"choices":[],
-            "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}})));
+            "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,
+                     "prompt_tokens_details":{"cached_tokens":1}}})));
         use CanonicalEvent::*;
         assert_eq!(
             evs[0],
@@ -512,7 +523,8 @@ mod tests {
             &Usage {
                 input_tokens: 3,
                 output_tokens: 2,
-                total_tokens: 5
+                total_tokens: 5,
+                cached_input_tokens: 1
             }
         );
     }
