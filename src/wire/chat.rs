@@ -57,10 +57,16 @@ pub fn build_request(req: &CanonicalRequest, upstream_model: &str, provider: &Pr
         let tools: Vec<Value> = req
             .tools
             .iter()
-            .map(|t| json!({
-                "type": "function",
-                "function": {"name": t.name, "description": t.description, "parameters": t.parameters}
-            }))
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": sanitize_parameters(&t.parameters),
+                    }
+                })
+            })
             .collect();
         body.insert("tools".into(), json!(tools));
         body.insert("tool_choice".into(), tool_choice_json(&req.tool_choice));
@@ -87,6 +93,53 @@ pub fn build_request(req: &CanonicalRequest, upstream_model: &str, provider: &Pr
     }
 
     Value::Object(body)
+}
+
+/// Repair a tool's `parameters` JSON Schema before forwarding to a strict upstream.
+///
+/// Some clients (notably VS Code Copilot's built-in tools such as
+/// `terminal_last_command`) emit schemas carrying `"type": null` instead of a
+/// real type — invalid JSON Schema that DeepSeek and other strict validators
+/// reject. Function `parameters` must also be an object schema, so a missing or
+/// non-object schema is coerced to an empty one.
+fn sanitize_parameters(params: &Value) -> Value {
+    match params {
+        Value::Object(_) => {
+            let mut v = params.clone();
+            sanitize_schema(&mut v, true);
+            v
+        }
+        _ => json!({"type": "object", "properties": {}}),
+    }
+}
+
+/// Recursively repair a JSON Schema node in place: replace an invalid
+/// `"type": null` with an inferred type (`object`/`array` from shape hints, or
+/// `object` at the schema root), otherwise drop the key — a schema with no
+/// `type` is valid and means "any".
+fn sanitize_schema(node: &mut Value, is_root: bool) {
+    match node {
+        Value::Object(map) => {
+            if matches!(map.get("type"), Some(Value::Null)) {
+                if is_root || map.contains_key("properties") {
+                    map.insert("type".into(), json!("object"));
+                } else if map.contains_key("items") {
+                    map.insert("type".into(), json!("array"));
+                } else {
+                    map.remove("type");
+                }
+            }
+            for child in map.values_mut() {
+                sanitize_schema(child, false);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                sanitize_schema(child, false);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Parse a Chat Completions *request* body into the canonical request
@@ -125,10 +178,16 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest, BridgeError> {
                         .get("reasoning_content")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
+                    // Null/absent/empty content (e.g. a pure tool-call turn) -> no text.
+                    let text = m
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
                     messages.push(Message::Assistant {
-                        text: Some(content),
+                        text,
                         reasoning_content: rc,
-                        tool_calls: vec![],
+                        tool_calls: parse_chat_tool_calls(m.get("tool_calls")),
                     })
                 }
                 _ => messages.push(Message::User(content)),
@@ -140,8 +199,8 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest, BridgeError> {
         model,
         system,
         messages,
-        tools: vec![],
-        tool_choice: ToolChoice::Auto,
+        tools: parse_chat_tools(obj.get("tools")),
+        tool_choice: parse_chat_tool_choice(obj.get("tool_choice")),
         temperature: obj
             .get("temperature")
             .and_then(|v| v.as_f64())
@@ -152,9 +211,78 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest, BridgeError> {
             .and_then(|v| v.as_u64())
             .map(|n| n as u32),
         reasoning_effort: None,
-        parallel_tool_calls: None,
+        parallel_tool_calls: obj.get("parallel_tool_calls").and_then(|v| v.as_bool()),
         stream,
     })
+}
+
+/// Parse Chat Completions `tools` (each def nested under `function`) into canonical
+/// `ToolDef`s. Only `type: "function"` entries are kept; raw `parameters` are carried
+/// through verbatim (`build_request` sanitizes the schema before forwarding upstream).
+fn parse_chat_tools(v: Option<&Value>) -> Vec<ToolDef> {
+    let Some(arr) = v.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|t| {
+            let f = t.get("function")?;
+            let name = f.get("name").and_then(|v| v.as_str())?.to_string();
+            Some(ToolDef {
+                name,
+                description: f
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                parameters: f.get("parameters").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+/// Parse a Chat Completions `tool_choice` (`"none"`/`"auto"`/`"required"`, or
+/// `{"type":"function","function":{"name":..}}`) into the canonical choice.
+fn parse_chat_tool_choice(v: Option<&Value>) -> ToolChoice {
+    match v {
+        Some(Value::String(s)) => match s.as_str() {
+            "none" => ToolChoice::None,
+            "required" => ToolChoice::Required,
+            _ => ToolChoice::Auto,
+        },
+        Some(Value::Object(o)) => o
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .map(|n| ToolChoice::Function(n.to_string()))
+            .unwrap_or(ToolChoice::Auto),
+        _ => ToolChoice::Auto,
+    }
+}
+
+/// Parse assistant-message `tool_calls` (Chat Completions shape:
+/// `{"id":..,"function":{"name":..,"arguments":..}}`) into canonical `ToolCall`s.
+fn parse_chat_tool_calls(v: Option<&Value>) -> Vec<ToolCall> {
+    let Some(arr) = v.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|tc| {
+            let f = tc.get("function")?;
+            let name = f.get("name").and_then(|v| v.as_str())?.to_string();
+            Some(ToolCall {
+                call_id: tc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name,
+                arguments: f
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect()
 }
 
 fn tool_choice_json(tc: &ToolChoice) -> Value {
@@ -484,6 +612,68 @@ mod tests {
     }
 
     #[test]
+    fn sanitizes_invalid_tool_parameter_schemas() {
+        // Some clients (e.g. VS Code Copilot's built-in tools like
+        // `terminal_last_command`) emit `"type": null` instead of `"object"`,
+        // which strict upstreams (DeepSeek) reject. The bridge must repair the
+        // schema before forwarding.
+        let req = CanonicalRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![Message::User("x".into())],
+            tools: vec![
+                // Top-level `type: null` with properties -> "object".
+                ToolDef {
+                    name: "with_props".into(),
+                    description: None,
+                    parameters: json!({"type": null, "properties": {"path": {"type": "string"}}}),
+                },
+                // No schema at all -> minimal valid object schema.
+                ToolDef {
+                    name: "no_args".into(),
+                    description: None,
+                    parameters: Value::Null,
+                },
+                // Nested `type: null` with no shape hint -> drop the key (valid "any");
+                // sibling keys preserved.
+                ToolDef {
+                    name: "nested".into(),
+                    description: None,
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {"x": {"type": null, "description": "d"}}
+                    }),
+                },
+            ],
+            tool_choice: ToolChoice::Auto,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            parallel_tool_calls: None,
+            stream: false,
+        };
+        let body = build_request(&req, "m", &provider());
+        let tools = &body["tools"];
+
+        // Top-level null type repaired to "object"; existing properties preserved.
+        assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["path"]["type"],
+            "string"
+        );
+
+        // Missing schema becomes a valid empty object schema.
+        assert_eq!(tools[1]["function"]["parameters"]["type"], "object");
+        assert!(tools[1]["function"]["parameters"]["properties"].is_object());
+
+        // Nested null type dropped, leaving a valid schema; sibling keys preserved.
+        let x = &tools[2]["function"]["parameters"]["properties"]["x"];
+        assert!(x.get("type").is_none());
+        assert_eq!(x["description"], "d");
+    }
+
+    #[test]
     fn honors_max_tokens_field_name() {
         let mut p = provider();
         p.max_tokens_field = "max_completion_tokens".into();
@@ -589,6 +779,57 @@ mod tests {
         assert_eq!(req.messages, vec![Message::User("hi".into())]);
         assert!(req.stream);
         assert_eq!(req.max_output_tokens, Some(50));
+    }
+
+    #[test]
+    fn parses_chat_inbound_tools_and_tool_calls() {
+        let body = json!({"model": "m", "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "f", "arguments": "{\"a\":1}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+        ],
+        "tools": [
+            {"type": "function",
+             "function": {"name": "f", "description": "d", "parameters": {"type": "object"}}}
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "f"}},
+        "parallel_tool_calls": true});
+        let req = parse_request(&body).unwrap();
+
+        // Tools parsed from the nested Chat Completions shape (function.{name,..}).
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, "f");
+        assert_eq!(req.tools[0].description.as_deref(), Some("d"));
+        assert_eq!(req.tools[0].parameters["type"], "object");
+
+        // tool_choice object form reads function.name; parallel flag carried through.
+        assert_eq!(req.tool_choice, ToolChoice::Function("f".into()));
+        assert_eq!(req.parallel_tool_calls, Some(true));
+
+        // Assistant tool_calls parsed; null content -> no text.
+        match &req.messages[1] {
+            Message::Assistant {
+                text, tool_calls, ..
+            } => {
+                assert!(text.is_none());
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].call_id, "c1");
+                assert_eq!(tool_calls[0].name, "f");
+                assert_eq!(tool_calls[0].arguments, "{\"a\":1}");
+            }
+            other => panic!("expected assistant tool call, got {other:?}"),
+        }
+        // Tool result still parsed.
+        assert_eq!(
+            req.messages[2],
+            Message::Tool {
+                call_id: "c1".into(),
+                output: "ok".into()
+            }
+        );
     }
 
     #[test]
