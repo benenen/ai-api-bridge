@@ -6,12 +6,49 @@ use crate::canonical::*;
 use crate::config::Provider;
 use crate::error::BridgeError;
 
+/// Ensure every `tool` message has a preceding `assistant` carrying a matching
+/// `tool_calls` entry. Some clients (VS Code Copilot Chat via the Responses API)
+/// send a `function_call_output` without repeating the `function_call` that
+/// produced it — strict upstreams (DeepSeek) require the assistant→tool structure.
+fn normalize_tool_parents(msgs: &[Message]) -> Vec<Message> {
+    let mut out = Vec::with_capacity(msgs.len() + 4);
+    for m in msgs {
+        match m {
+            Message::Tool { call_id, output } => {
+                let has_parent = matches!(
+                    out.last(),
+                    Some(Message::Assistant { tool_calls, .. })
+                    if tool_calls.iter().any(|tc| tc.call_id == *call_id)
+                );
+                if !has_parent {
+                    out.push(Message::Assistant {
+                        text: None,
+                        reasoning_content: None,
+                        tool_calls: vec![ToolCall {
+                            call_id: call_id.clone(),
+                            name: String::from("_"),
+                            arguments: String::from("{}"),
+                        }],
+                    });
+                }
+                out.push(Message::Tool {
+                    call_id: call_id.clone(),
+                    output: output.clone(),
+                });
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
 pub fn build_request(req: &CanonicalRequest, upstream_model: &str, provider: &Provider) -> Value {
+    let messages_normalized = normalize_tool_parents(&req.messages);
     let mut messages: Vec<Value> = Vec::new();
     if let Some(sys) = &req.system {
         messages.push(json!({"role": "system", "content": sys}));
     }
-    for m in &req.messages {
+    for m in &messages_normalized {
         match m {
             Message::User(text) => messages.push(json!({"role": "user", "content": text})),
             Message::Assistant {
@@ -128,6 +165,13 @@ fn sanitize_schema(node: &mut Value, is_root: bool) {
                 } else {
                     map.remove("type");
                 }
+            }
+            // At the root, a missing `type` also defaults to "object" —
+            // function parameters must be an object schema, and an empty
+            // `{}` (which VS Code Copilot sends for e.g. terminal_last_command)
+            // is technically "any" but strict upstreams may reject it.
+            if is_root && !map.contains_key("type") {
+                map.insert("type".into(), json!("object"));
             }
             for child in map.values_mut() {
                 sanitize_schema(child, false);
@@ -644,6 +688,12 @@ mod tests {
                         "properties": {"x": {"type": null, "description": "d"}}
                     }),
                 },
+                // Empty schema {} (terminal_last_command style) -> gets type: "object".
+                ToolDef {
+                    name: "empty".into(),
+                    description: None,
+                    parameters: json!({}),
+                },
             ],
             tool_choice: ToolChoice::Auto,
             temperature: None,
@@ -671,6 +721,9 @@ mod tests {
         let x = &tools[2]["function"]["parameters"]["properties"]["x"];
         assert!(x.get("type").is_none());
         assert_eq!(x["description"], "d");
+
+        // Empty {} root schema defaults to type: "object".
+        assert_eq!(tools[3]["function"]["parameters"]["type"], "object");
     }
 
     #[test]
