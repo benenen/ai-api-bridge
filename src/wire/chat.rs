@@ -21,9 +21,14 @@ fn normalize_tool_parents(msgs: &[Message]) -> Vec<Message> {
                     if tool_calls.iter().any(|tc| tc.call_id == *call_id)
                 );
                 if !has_parent {
+                    // Synthesize an assistant carrying a dummy tool_calls entry so
+                    // the following `tool` passes strict upstream validation
+                    // (DeepSeek). Set reasoning_content to "" — in thinking mode
+                    // DeepSeek requires the field to be present on every assistant,
+                    // and an empty string means "this turn had no reasoning."
                     out.push(Message::Assistant {
                         text: None,
-                        reasoning_content: None,
+                        reasoning_content: Some(String::new()),
                         tool_calls: vec![ToolCall {
                             call_id: call_id.clone(),
                             name: String::from("_"),
@@ -724,6 +729,94 @@ mod tests {
 
         // Empty {} root schema defaults to type: "object".
         assert_eq!(tools[3]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn normalizes_orphaned_tool_messages() {
+        // Some clients (VS Code Copilot Chat) send function_call_output without
+        // repeating the function_call. DeepSeek requires every `tool` to follow
+        // an `assistant` with matching `tool_calls`. normalize_tool_parents must
+        // synthesize the missing assistant.
+        let req = CanonicalRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![
+                Message::User("do it".into()),
+                // Orphaned tool — no preceding assistant with tool_calls.
+                Message::Tool {
+                    call_id: "c1".into(),
+                    output: "result".into(),
+                },
+                Message::User("next".into()),
+            ],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            parallel_tool_calls: None,
+            stream: false,
+        };
+        let body = build_request(&req, "m", &provider());
+        let msgs = body["messages"].as_array().unwrap();
+        // messages should be: [user "do it", assistant {tool_calls: [c1/_]}, tool "result", user "next"]
+        assert_eq!(msgs.len(), 4, "expected 4 messages, got {msgs:?}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert!(msgs[1]["content"].is_null());
+        // Synthesized assistant must carry reasoning_content (empty) so DeepSeek
+        // thinking mode passes validation.
+        assert_eq!(msgs[1]["reasoning_content"], "");
+        let tc = &msgs[1]["tool_calls"][0];
+        assert_eq!(tc["id"], "c1");
+        assert_eq!(tc["function"]["name"], "_");
+        assert_eq!(tc["function"]["arguments"], "{}");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "c1");
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(msgs[3]["content"], "next");
+    }
+
+    #[test]
+    fn leaves_paired_tool_messages_unchanged() {
+        // When a tool message already has a preceding matching assistant, don't
+        // add a duplicate.
+        let req = CanonicalRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![
+                Message::User("do it".into()),
+                Message::Assistant {
+                    text: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        call_id: "c1".into(),
+                        name: "exec".into(),
+                        arguments: "{}".into(),
+                    }],
+                },
+                Message::Tool {
+                    call_id: "c1".into(),
+                    output: "result".into(),
+                },
+            ],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            parallel_tool_calls: None,
+            stream: false,
+        };
+        let body = build_request(&req, "m", &provider());
+        let msgs = body["messages"].as_array().unwrap();
+        // Should remain 3 messages — no synthesized assistant.
+        assert_eq!(msgs.len(), 3, "expected 3 messages, got {msgs:?}");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "exec");
+        assert_eq!(msgs[2]["role"], "tool");
     }
 
     #[test]

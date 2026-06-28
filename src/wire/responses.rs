@@ -140,12 +140,34 @@ fn parse_input_item(
                 Some(other) => other.to_string(),
                 None => String::new(),
             };
+            let call_id = str_field(item, "call_id");
             // The tool result ends the assistant turn; drop any unconsumed reasoning.
             *pending_reasoning = None;
-            messages.push(Message::Tool {
-                call_id: str_field(item, "call_id"),
-                output,
-            });
+            // Some clients (notably VS Code Copilot Chat) send only the
+            // function_call_output in the next request without repeating the
+            // function_call that produced it, expecting the model to remember
+            // it from the previous response. DeepSeek and other strict upstreams
+            // require every `tool` message to have a preceding `assistant` with
+            // `tool_calls`. When the function_call is missing, synthesize one.
+            let has_parent = matches!(
+                messages.last(),
+                Some(Message::Assistant { tool_calls, .. })
+                if tool_calls.iter().any(|tc| tc.call_id == call_id)
+            );
+            if !has_parent {
+                // In thinking mode DeepSeek requires `reasoning_content` on every
+                // assistant message — set it to "" so the field is present.
+                messages.push(Message::Assistant {
+                    text: None,
+                    reasoning_content: Some(String::new()),
+                    tool_calls: vec![ToolCall {
+                        call_id: call_id.clone(),
+                        name: String::from("_"),
+                        arguments: String::from("{}"),
+                    }],
+                });
+            }
+            messages.push(Message::Tool { call_id, output });
         }
         // Stash reasoning to attach to the assistant turn that follows it.
         "reasoning" => {
@@ -711,6 +733,56 @@ mod tests {
             .expect("assistant");
         assert_eq!(a.1.len(), 1);
         assert_eq!(a.0.as_deref(), Some("step one"));
+    }
+
+    #[test]
+    fn synthesizes_missing_function_call_for_orphaned_output() {
+        // VS Code Copilot Chat sends function_call_output without repeating
+        // the function_call in the next request. The parser must synthesize
+        // an assistant message with a matching tool_call so DeepSeek sees
+        // the required assistant→tool structure.
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+            ]
+        });
+        let req = parse_request(&body).unwrap();
+        assert_eq!(
+            req.messages.len(),
+            4,
+            "expected [user, assistant(tool_calls), tool, user], got {:?}",
+            req.messages
+        );
+        // msg[1] should be the synthesized assistant.
+        match &req.messages[1] {
+            Message::Assistant {
+                text,
+                reasoning_content,
+                tool_calls,
+                ..
+            } => {
+                assert!(text.is_none());
+                // In thinking mode, reasoning_content must be present (even if empty)
+                // so DeepSeek passes the validation.
+                assert_eq!(reasoning_content.as_deref(), Some(""));
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].call_id, "c1");
+            }
+            other => panic!("expected assistant, got {other:?}"),
+        }
+        // msg[2] should be the tool result.
+        assert_eq!(
+            req.messages[2],
+            Message::Tool {
+                call_id: "c1".into(),
+                output: "ok".into()
+            }
+        );
+        // msg[3] is the user follow-up.
+        assert_eq!(req.messages[3], Message::User("next".into()));
     }
 
     use crate::canonical::CanonicalEvent::*;
