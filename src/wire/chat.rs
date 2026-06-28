@@ -6,26 +6,39 @@ use crate::canonical::*;
 use crate::config::Provider;
 use crate::error::BridgeError;
 
+/// Check whether any already-emitted assistant message (skipping past
+/// intervening `tool` results) carries a tool_calls entry matching `call_id`.
+/// This handles parallel tool calls: after `Assistant(c1,c2) → Tool(c1)`,
+/// `Tool(c2)` must still find its parent by walking backwards.
+fn find_matching_tool_call(msgs: &[Message], call_id: &str) -> bool {
+    msgs.iter().rev().any(|m| match m {
+        Message::Assistant { tool_calls, .. } => tool_calls.iter().any(|tc| tc.call_id == call_id),
+        Message::Tool { .. } => false, // skip over preceding tool results
+        _ => false,                    // stop at any other role
+    })
+}
+
 /// Ensure every `tool` message has a preceding `assistant` carrying a matching
 /// `tool_calls` entry. Some clients (VS Code Copilot Chat via the Responses API)
 /// send a `function_call_output` without repeating the `function_call` that
 /// produced it — strict upstreams (DeepSeek) require the assistant→tool structure.
 fn normalize_tool_parents(msgs: &[Message]) -> Vec<Message> {
+    // Fast path: no tool messages → nothing to fix.
+    if !msgs.iter().any(|m| matches!(m, Message::Tool { .. })) {
+        return msgs.to_vec();
+    }
     let mut out = Vec::with_capacity(msgs.len() + 4);
     for m in msgs {
         match m {
             Message::Tool { call_id, output } => {
-                let has_parent = matches!(
-                    out.last(),
-                    Some(Message::Assistant { tool_calls, .. })
-                    if tool_calls.iter().any(|tc| tc.call_id == *call_id)
-                );
-                if !has_parent {
+                if !find_matching_tool_call(&out, call_id) {
                     // Synthesize an assistant carrying a dummy tool_calls entry so
                     // the following `tool` passes strict upstream validation
                     // (DeepSeek). Set reasoning_content to "" — in thinking mode
                     // DeepSeek requires the field to be present on every assistant,
                     // and an empty string means "this turn had no reasoning."
+                    // NOTE: reasining_content is set unconditionally; non-thinking
+                    // models ignore the extra field harmlessly.
                     out.push(Message::Assistant {
                         text: None,
                         reasoning_content: Some(String::new()),
@@ -817,6 +830,74 @@ mod tests {
         assert_eq!(msgs[1]["role"], "assistant");
         assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "exec");
         assert_eq!(msgs[2]["role"], "tool");
+    }
+
+    #[test]
+    fn finds_parent_across_parallel_tool_results() {
+        // Assistant(c1,c2) → Tool(c1) → Tool(c2): when processing Tool(c2),
+        // `out.last()` is Tool(c1) — a naive last() check would miss the
+        // parent and synthesize a duplicate assistant.
+        let req = CanonicalRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![
+                Message::User("do two things".into()),
+                Message::Assistant {
+                    text: None,
+                    reasoning_content: Some("need parallel calls".into()),
+                    tool_calls: vec![
+                        ToolCall {
+                            call_id: "c1".into(),
+                            name: "read".into(),
+                            arguments: r#"{"path":"a"}"#.into(),
+                        },
+                        ToolCall {
+                            call_id: "c2".into(),
+                            name: "read".into(),
+                            arguments: r#"{"path":"b"}"#.into(),
+                        },
+                    ],
+                },
+                Message::Tool {
+                    call_id: "c1".into(),
+                    output: "content a".into(),
+                },
+                Message::Tool {
+                    call_id: "c2".into(),
+                    output: "content b".into(),
+                },
+                Message::User("summarize".into()),
+            ],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            parallel_tool_calls: None,
+            stream: false,
+        };
+        let body = build_request(&req, "m", &provider());
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5, "expected 5 messages, got {msgs:?}");
+        // msg[0]: user
+        assert_eq!(msgs[0]["role"], "user");
+        // msg[1]: assistant with both tool_calls
+        assert_eq!(msgs[1]["role"], "assistant");
+        let tcs = msgs[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(tcs.len(), 2);
+        assert_eq!(tcs[0]["id"], "c1");
+        assert_eq!(tcs[1]["id"], "c2");
+        // reasoning_content must survive round-trip
+        assert_eq!(msgs[1]["reasoning_content"], "need parallel calls");
+        // msg[2]: tool result for c1
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "c1");
+        // msg[3]: tool result for c2 — must NOT have an extra synthesized assistant
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "c2");
+        // msg[4]: user follow-up
+        assert_eq!(msgs[4]["role"], "user");
     }
 
     #[test]

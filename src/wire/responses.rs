@@ -148,15 +148,22 @@ fn parse_input_item(
             // function_call that produced it, expecting the model to remember
             // it from the previous response. DeepSeek and other strict upstreams
             // require every `tool` message to have a preceding `assistant` with
-            // `tool_calls`. When the function_call is missing, synthesize one.
-            let has_parent = matches!(
-                messages.last(),
-                Some(Message::Assistant { tool_calls, .. })
-                if tool_calls.iter().any(|tc| tc.call_id == call_id)
-            );
+            // `tool_calls`.
+            //
+            // Walk backwards past preceding tool results to find the parent
+            // assistant — otherwise parallel tool calls (Assistant(c1,c2) →
+            // Tool(c1) → Tool(c2)) would miss the parent when processing Tool(c2).
+            let has_parent = messages.iter().rev().any(|m| match m {
+                Message::Assistant { tool_calls, .. } => {
+                    tool_calls.iter().any(|tc| tc.call_id == call_id)
+                }
+                Message::Tool { .. } => false,
+                _ => false,
+            });
             if !has_parent {
                 // In thinking mode DeepSeek requires `reasoning_content` on every
                 // assistant message — set it to "" so the field is present.
+                // Non-thinking models ignore the extra field harmlessly.
                 messages.push(Message::Assistant {
                     text: None,
                     reasoning_content: Some(String::new()),
@@ -783,6 +790,65 @@ mod tests {
         );
         // msg[3] is the user follow-up.
         assert_eq!(req.messages[3], Message::User("next".into()));
+    }
+
+    #[test]
+    fn finds_parent_across_parallel_function_call_outputs() {
+        // User → function_call(c1) → function_call(c2) →
+        //      function_call_output(c1) → function_call_output(c2):
+        // when processing output(c2), the last message is Tool(c1), not
+        // Assistant — a naive last() check would miss the parent and synthesize
+        // a duplicate. The parser must walk backwards past Tool messages.
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "do two things"}]},
+                {"type": "function_call", "call_id": "c1", "name": "read", "arguments": r#"{"path":"a"}"#},
+                {"type": "function_call", "call_id": "c2", "name": "read", "arguments": r#"{"path":"b"}"#},
+                {"type": "function_call_output", "call_id": "c1", "output": "content a"},
+                {"type": "function_call_output", "call_id": "c2", "output": "content b"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+            ]
+        });
+        let req = parse_request(&body).unwrap();
+        assert_eq!(
+            req.messages.len(),
+            5,
+            "expected [user, assistant(c1,c2), tool(c1), tool(c2), user], got {:?}",
+            req.messages
+        );
+        // msg[1]: single assistant with both tool_calls (merged from the two
+        // consecutive function_call items).
+        match &req.messages[1] {
+            Message::Assistant { tool_calls, .. } => {
+                assert_eq!(
+                    tool_calls.len(),
+                    2,
+                    "both c1 and c2 must be on the same assistant"
+                );
+                assert_eq!(tool_calls[0].call_id, "c1");
+                assert_eq!(tool_calls[1].call_id, "c2");
+            }
+            other => panic!("expected assistant, got {other:?}"),
+        }
+        // msg[2]: tool result for c1
+        assert_eq!(
+            req.messages[2],
+            Message::Tool {
+                call_id: "c1".into(),
+                output: "content a".into()
+            }
+        );
+        // msg[3]: tool result for c2 — must NOT have a duplicate assistant inserted
+        assert_eq!(
+            req.messages[3],
+            Message::Tool {
+                call_id: "c2".into(),
+                output: "content b".into()
+            }
+        );
+        // msg[4]: user follow-up
+        assert_eq!(req.messages[4], Message::User("next".into()));
     }
 
     use crate::canonical::CanonicalEvent::*;
