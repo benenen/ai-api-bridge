@@ -1,5 +1,7 @@
 //! OpenAI Chat Completions wire format — outbound (client) side.
 
+use std::borrow::Cow;
+
 use serde_json::{Map, Value, json};
 
 use crate::canonical::*;
@@ -13,8 +15,9 @@ use crate::error::BridgeError;
 fn find_matching_tool_call(msgs: &[Message], call_id: &str) -> bool {
     msgs.iter().rev().any(|m| match m {
         Message::Assistant { tool_calls, .. } => tool_calls.iter().any(|tc| tc.call_id == call_id),
-        Message::Tool { .. } => false, // skip over preceding tool results
-        _ => false,                    // stop at any other role
+        // Not a parent assistant — keep scanning backwards past tool results and
+        // other turns (call_ids are unique, so no intervening message aliases it).
+        _ => false,
     })
 }
 
@@ -22,10 +25,10 @@ fn find_matching_tool_call(msgs: &[Message], call_id: &str) -> bool {
 /// `tool_calls` entry. Some clients (VS Code Copilot Chat via the Responses API)
 /// send a `function_call_output` without repeating the `function_call` that
 /// produced it — strict upstreams (DeepSeek) require the assistant→tool structure.
-fn normalize_tool_parents(msgs: &[Message]) -> Vec<Message> {
-    // Fast path: no tool messages → nothing to fix.
+fn normalize_tool_parents(msgs: &[Message]) -> Cow<'_, [Message]> {
+    // Fast path: no tool messages → nothing to fix, borrow without allocating.
     if !msgs.iter().any(|m| matches!(m, Message::Tool { .. })) {
-        return msgs.to_vec();
+        return Cow::Borrowed(msgs);
     }
     let mut out = Vec::with_capacity(msgs.len() + 4);
     for m in msgs {
@@ -37,7 +40,7 @@ fn normalize_tool_parents(msgs: &[Message]) -> Vec<Message> {
                     // (DeepSeek). Set reasoning_content to "" — in thinking mode
                     // DeepSeek requires the field to be present on every assistant,
                     // and an empty string means "this turn had no reasoning."
-                    // NOTE: reasining_content is set unconditionally; non-thinking
+                    // reasoning_content is set unconditionally; non-thinking
                     // models ignore the extra field harmlessly.
                     out.push(Message::Assistant {
                         text: None,
@@ -57,7 +60,7 @@ fn normalize_tool_parents(msgs: &[Message]) -> Vec<Message> {
             other => out.push(other.clone()),
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 pub fn build_request(req: &CanonicalRequest, upstream_model: &str, provider: &Provider) -> Value {
@@ -66,7 +69,7 @@ pub fn build_request(req: &CanonicalRequest, upstream_model: &str, provider: &Pr
     if let Some(sys) = &req.system {
         messages.push(json!({"role": "system", "content": sys}));
     }
-    for m in &messages_normalized {
+    for m in messages_normalized.iter() {
         match m {
             Message::User(text) => messages.push(json!({"role": "user", "content": text})),
             Message::Assistant {

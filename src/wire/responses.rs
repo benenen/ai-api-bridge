@@ -144,36 +144,13 @@ fn parse_input_item(
             // The tool result ends the assistant turn; drop any unconsumed reasoning.
             *pending_reasoning = None;
             // Some clients (notably VS Code Copilot Chat) send only the
-            // function_call_output in the next request without repeating the
-            // function_call that produced it, expecting the model to remember
-            // it from the previous response. DeepSeek and other strict upstreams
-            // require every `tool` message to have a preceding `assistant` with
-            // `tool_calls`.
-            //
-            // Walk backwards past preceding tool results to find the parent
-            // assistant — otherwise parallel tool calls (Assistant(c1,c2) →
-            // Tool(c1) → Tool(c2)) would miss the parent when processing Tool(c2).
-            let has_parent = messages.iter().rev().any(|m| match m {
-                Message::Assistant { tool_calls, .. } => {
-                    tool_calls.iter().any(|tc| tc.call_id == call_id)
-                }
-                Message::Tool { .. } => false,
-                _ => false,
-            });
-            if !has_parent {
-                // In thinking mode DeepSeek requires `reasoning_content` on every
-                // assistant message — set it to "" so the field is present.
-                // Non-thinking models ignore the extra field harmlessly.
-                messages.push(Message::Assistant {
-                    text: None,
-                    reasoning_content: Some(String::new()),
-                    tool_calls: vec![ToolCall {
-                        call_id: call_id.clone(),
-                        name: String::from("_"),
-                        arguments: String::from("{}"),
-                    }],
-                });
-            }
+            // function_call_output without repeating the function_call that
+            // produced it. Strict upstreams (DeepSeek) require every `tool`
+            // message to follow an `assistant` carrying matching `tool_calls`,
+            // but synthesizing that missing parent is the job of the single
+            // outbound chokepoint (`normalize_tool_parents` in
+            // wire::chat::build_request) — which also covers the Anthropic
+            // inbound path — so the parser just emits the bare tool result here.
             messages.push(Message::Tool { call_id, output });
         }
         // Stash reasoning to attach to the assistant turn that follows it.
@@ -743,11 +720,12 @@ mod tests {
     }
 
     #[test]
-    fn synthesizes_missing_function_call_for_orphaned_output() {
-        // VS Code Copilot Chat sends function_call_output without repeating
-        // the function_call in the next request. The parser must synthesize
-        // an assistant message with a matching tool_call so DeepSeek sees
-        // the required assistant→tool structure.
+    fn orphaned_output_parses_to_bare_tool() {
+        // VS Code Copilot Chat sends function_call_output without repeating the
+        // function_call. The parser leaves it as a bare `tool` message; the
+        // assistant→tool_calls parent that strict upstreams (DeepSeek) require is
+        // synthesized later by the outbound chokepoint (normalize_tool_parents in
+        // wire::chat::build_request, tested there), not here.
         let body = json!({
             "model": "gpt-5.5",
             "input": [
@@ -758,47 +736,27 @@ mod tests {
         });
         let req = parse_request(&body).unwrap();
         assert_eq!(
-            req.messages.len(),
-            4,
-            "expected [user, assistant(tool_calls), tool, user], got {:?}",
+            req.messages,
+            vec![
+                Message::User("go".into()),
+                Message::Tool {
+                    call_id: "c1".into(),
+                    output: "ok".into()
+                },
+                Message::User("next".into()),
+            ],
+            "orphaned output should parse to a bare tool, got {:?}",
             req.messages
         );
-        // msg[1] should be the synthesized assistant.
-        match &req.messages[1] {
-            Message::Assistant {
-                text,
-                reasoning_content,
-                tool_calls,
-                ..
-            } => {
-                assert!(text.is_none());
-                // In thinking mode, reasoning_content must be present (even if empty)
-                // so DeepSeek passes the validation.
-                assert_eq!(reasoning_content.as_deref(), Some(""));
-                assert_eq!(tool_calls.len(), 1);
-                assert_eq!(tool_calls[0].call_id, "c1");
-            }
-            other => panic!("expected assistant, got {other:?}"),
-        }
-        // msg[2] should be the tool result.
-        assert_eq!(
-            req.messages[2],
-            Message::Tool {
-                call_id: "c1".into(),
-                output: "ok".into()
-            }
-        );
-        // msg[3] is the user follow-up.
-        assert_eq!(req.messages[3], Message::User("next".into()));
     }
 
     #[test]
-    fn finds_parent_across_parallel_function_call_outputs() {
+    fn merges_consecutive_function_calls_into_one_assistant() {
         // User → function_call(c1) → function_call(c2) →
         //      function_call_output(c1) → function_call_output(c2):
-        // when processing output(c2), the last message is Tool(c1), not
-        // Assistant — a naive last() check would miss the parent and synthesize
-        // a duplicate. The parser must walk backwards past Tool messages.
+        // the two consecutive function_call items must merge into a single
+        // assistant carrying both tool_calls, and each output parses to a bare
+        // tool result in order (no spurious extra assistant between them).
         let body = json!({
             "model": "gpt-5.5",
             "input": [
