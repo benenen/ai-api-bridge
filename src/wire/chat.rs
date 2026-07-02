@@ -8,33 +8,35 @@ use crate::canonical::*;
 use crate::config::Provider;
 use crate::error::BridgeError;
 
-/// Check whether any already-emitted assistant message (skipping past
-/// intervening `tool` results) carries a tool_calls entry matching `call_id`.
-/// This handles parallel tool calls: after `Assistant(c1,c2) → Tool(c1)`,
-/// `Tool(c2)` must still find its parent by walking backwards.
-fn find_matching_tool_call(msgs: &[Message], call_id: &str) -> bool {
-    msgs.iter().rev().any(|m| match m {
-        Message::Assistant { tool_calls, .. } => tool_calls.iter().any(|tc| tc.call_id == call_id),
-        // Not a parent assistant — keep scanning backwards past tool results and
-        // other turns (call_ids are unique, so no intervening message aliases it).
-        _ => false,
-    })
-}
-
 /// Ensure every `tool` message has a preceding `assistant` carrying a matching
 /// `tool_calls` entry. Some clients (VS Code Copilot Chat via the Responses API)
 /// send a `function_call_output` without repeating the `function_call` that
 /// produced it — strict upstreams (DeepSeek) require the assistant→tool structure.
+///
+/// Single pass, O(n): `announced` holds every non-empty call_id an assistant
+/// (real or synthesized) has already claimed, so pairing each `tool` to a parent
+/// is an O(1) set lookup rather than a backward scan. A `tool` with an empty
+/// call_id is malformed and can't be reliably matched, so it always gets its own
+/// freshly synthesized parent instead of aliasing an earlier empty-id one.
 fn normalize_tool_parents(msgs: &[Message]) -> Cow<'_, [Message]> {
     // Fast path: no tool messages → nothing to fix, borrow without allocating.
     if !msgs.iter().any(|m| matches!(m, Message::Tool { .. })) {
         return Cow::Borrowed(msgs);
     }
     let mut out = Vec::with_capacity(msgs.len() + 4);
+    let mut announced: HashSet<String> = HashSet::new();
     for m in msgs {
         match m {
+            Message::Assistant { tool_calls, .. } => {
+                for tc in tool_calls {
+                    if !tc.call_id.is_empty() {
+                        announced.insert(tc.call_id.clone());
+                    }
+                }
+                out.push(m.clone());
+            }
             Message::Tool { call_id, output } => {
-                if !find_matching_tool_call(&out, call_id) {
+                if call_id.is_empty() || !announced.contains(call_id.as_str()) {
                     // Synthesize an assistant carrying a dummy tool_calls entry so
                     // the following `tool` passes strict upstream validation
                     // (DeepSeek). Set reasoning_content to "" — in thinking mode
@@ -51,6 +53,9 @@ fn normalize_tool_parents(msgs: &[Message]) -> Cow<'_, [Message]> {
                             arguments: String::from("{}"),
                         }],
                     });
+                    if !call_id.is_empty() {
+                        announced.insert(call_id.clone());
+                    }
                 }
                 out.push(Message::Tool {
                     call_id: call_id.clone(),
@@ -833,6 +838,51 @@ mod tests {
         assert_eq!(msgs[1]["role"], "assistant");
         assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "exec");
         assert_eq!(msgs[2]["role"], "tool");
+    }
+
+    #[test]
+    fn empty_call_id_tools_each_get_their_own_parent() {
+        // A malformed tool result with an empty call_id can't be reliably paired,
+        // so each one must get its OWN synthesized assistant. If empty ids aliased
+        // each other, the second tool would follow the first tool (not an
+        // assistant), which strict upstreams reject.
+        let req = CanonicalRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![
+                Message::User("go".into()),
+                Message::Tool {
+                    call_id: "".into(),
+                    output: "a".into(),
+                },
+                Message::Tool {
+                    call_id: "".into(),
+                    output: "b".into(),
+                },
+            ],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            parallel_tool_calls: None,
+            stream: false,
+        };
+        let body = build_request(&req, "m", &provider());
+        let msgs = body["messages"].as_array().unwrap();
+        // [user, assistant, tool "a", assistant, tool "b"] — one parent per tool.
+        assert_eq!(
+            msgs.len(),
+            5,
+            "each empty-id tool needs its own parent, got {msgs:?}"
+        );
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["content"], "a");
+        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[4]["role"], "tool");
+        assert_eq!(msgs[4]["content"], "b");
     }
 
     #[test]
